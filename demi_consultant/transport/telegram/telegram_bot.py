@@ -1,0 +1,445 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import logging
+from pathlib import Path
+from tempfile import gettempdir
+
+from telegram import Message, ReplyKeyboardRemove, Update
+from telegram.error import BadRequest, Conflict, TelegramError
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import MessageHandler as PTBMessageHandler
+from telegram.ext import filters
+
+from demi_consultant.core.config import Settings
+from demi_consultant.core.exceptions import ProcessLockError
+from demi_consultant.core.logger import log_extra
+from demi_consultant.core.process_lock import ProcessLock
+from demi_consultant.services.consultation_service import ConsultationService
+from demi_consultant.transport.base_channel_adapter import BaseChannelAdapter
+from demi_consultant.transport.telegram.handlers.error_handler import global_error_handler
+from demi_consultant.transport.telegram.handlers.start_handler import StartHandler
+from demi_consultant.transport.telegram.keyboards.main import (
+    BUTTON_AI_CONSULTATION,
+    BUTTON_PROBLEM_SOLVING,
+    BUTTON_SKIN_TYPE,
+    build_main_keyboard,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class TelegramCosmoBot(BaseChannelAdapter):
+    _BUSY_MESSAGE = (
+        "Секунду, пожалуйста 🤍\n"
+        "Я сейчас завершаю ответ на предыдущий вопрос и сразу продолжу диалог."
+    )
+    _TELEGRAM_REPLY_SOFT_LIMIT = 3900
+
+    def __init__(self, settings: Settings, consultation_service: ConsultationService) -> None:
+        if not settings.telegram_token:
+            raise ValueError("TELEGRAM_TOKEN is not configured")
+
+        self._settings = settings
+        self._consultation_service = consultation_service
+        self._keyboard = build_main_keyboard()
+        self._menu_labels = {
+            self._normalize_menu_text(BUTTON_AI_CONSULTATION),
+            self._normalize_menu_text(BUTTON_SKIN_TYPE),
+            self._normalize_menu_text(BUTTON_PROBLEM_SOLVING),
+        }
+        self._active_users: set[str] = set()
+        self._queued_busy_messages: dict[str, list[Message]] = {}
+        self._active_users_lock = asyncio.Lock()
+
+        self._application = (
+            ApplicationBuilder()
+            .token(settings.telegram_token)
+            .concurrent_updates(8)
+            .build()
+        )
+        self._start_handler = StartHandler()
+
+    async def handle_text(self, user_id: str, text: str, *, event_ts: float | None = None) -> str | None:
+        return await self._consultation_service.process_message(
+            user_id=user_id,
+            text=text,
+            channel="telegram",
+            event_ts=event_ts,
+        )
+
+    async def handle_image(
+        self,
+        user_id: str,
+        image_bytes: bytes,
+        *,
+        caption: str | None,
+        image_mime_type: str,
+        event_ts: float | None = None,
+    ) -> str | None:
+        return await self._consultation_service.process_photo(
+            user_id=user_id,
+            image_bytes=image_bytes,
+            caption=caption,
+            channel="telegram",
+            image_mime_type=image_mime_type,
+            event_ts=event_ts,
+        )
+
+    def _register_handlers(self) -> None:
+        self._application.add_handler(CommandHandler("start", self._on_start))
+        self._application.add_handler(PTBMessageHandler(filters.PHOTO, self._on_photo))
+        self._application.add_handler(
+            PTBMessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text)
+        )
+        self._application.add_error_handler(global_error_handler)
+
+    async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.effective_user is None:
+            return
+
+        user_id = str(update.effective_user.id)
+        session = self._consultation_service.get_session(user_id)
+        if session.onboarding_completed:
+            if update.message is None:
+                return
+            await update.message.reply_text(
+                "Рада снова Вас видеть 🤍\n"
+                "Можем продолжить консультацию: опишите, что сейчас беспокоит по коже.",
+                reply_to_message_id=update.message.message_id,
+            )
+            return
+        self._consultation_service.start_onboarding(user_id)
+        await self._start_handler(update, context)
+
+    async def _on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.message is None or update.message.text is None or update.effective_user is None:
+            return
+
+        source_message = update.message
+        user_id = str(update.effective_user.id)
+        text = source_message.text.strip()
+        session_before = self._consultation_service.get_session(user_id)
+        pending_message: Message | None = None
+        acquired = False
+
+        acquired = await self._try_begin_user_processing(user_id)
+        if not acquired:
+            await self._send_busy_message(source_message, user_id)
+            return
+
+        try:
+            if self._should_show_thinking(session_before, text):
+                pending_message = await self._send_thinking_message(source_message)
+
+            try:
+                reply = await self.handle_text(
+                    user_id,
+                    text,
+                    event_ts=self._event_timestamp(source_message),
+                )
+            except Exception as exc:  # pragma: no cover - transport safety net
+                logger.exception(
+                    "Telegram text handling failed: %s",
+                    exc,
+                    extra=log_extra(channel="telegram", user_id=user_id),
+                )
+                reply = "Вижу техническую ошибку. Попробуйте через минуту."
+
+            if not reply:
+                if pending_message is not None:
+                    await self._dismiss_pending_message(pending_message)
+                return
+
+            session = self._consultation_service.get_session(user_id)
+            reply_markup = self._select_reply_markup(session, text)
+            if pending_message is not None:
+                replaced = await self._replace_pending_with_reply(
+                    pending_message,
+                    reply,
+                    reply_markup=reply_markup,
+                )
+                if replaced:
+                    return
+                await self._dismiss_pending_message(pending_message)
+
+            await self._send_reply(source_message, reply, reply_markup=reply_markup)
+        finally:
+            if acquired:
+                await self._finish_user_processing(user_id)
+
+    async def _on_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.message is None or update.effective_user is None or not update.message.photo:
+            return
+
+        source_message = update.message
+        user_id = str(update.effective_user.id)
+        session_before = self._consultation_service.get_session(user_id)
+        pending_message: Message | None = None
+        acquired = False
+
+        acquired = await self._try_begin_user_processing(user_id)
+        if not acquired:
+            await self._send_busy_message(source_message, user_id)
+            return
+
+        try:
+            if session_before.onboarding_completed:
+                pending_message = await self._send_thinking_message(source_message)
+
+            photo = source_message.photo[-1]
+            photo_file = await photo.get_file()
+            photo_bytes = bytes(await photo_file.download_as_bytearray())
+            caption = (source_message.caption or "").strip() or None
+
+            try:
+                reply = await self.handle_image(
+                    user_id,
+                    photo_bytes,
+                    caption=caption,
+                    image_mime_type="image/jpeg",
+                    event_ts=self._event_timestamp(source_message),
+                )
+            except Exception as exc:  # pragma: no cover - transport safety net
+                logger.exception(
+                    "Telegram photo handling failed: %s",
+                    exc,
+                    extra=log_extra(channel="telegram", user_id=user_id),
+                )
+                reply = "Вижу техническую ошибку. Попробуйте через минуту."
+
+            if not reply:
+                if pending_message is not None:
+                    await self._dismiss_pending_message(pending_message)
+                return
+
+            if pending_message is not None:
+                replaced = await self._replace_pending_with_reply(pending_message, reply)
+                if replaced:
+                    return
+                await self._dismiss_pending_message(pending_message)
+
+            await self._send_reply(source_message, reply)
+        finally:
+            if acquired:
+                await self._finish_user_processing(user_id)
+
+    def _select_reply_markup(self, session, user_text: str):
+        if session.menu_active and not session.menu_shown_once:
+            session.menu_shown_once = True
+            return self._keyboard
+
+        normalized = self._normalize_menu_text(user_text)
+        if session.menu_active and normalized in self._menu_labels:
+            session.menu_active = False
+            return ReplyKeyboardRemove()
+
+        return None
+
+    async def _send_reply(self, source_message: Message, reply: str, reply_markup=None) -> None:
+        chunks = self._split_reply_chunks(reply, max_chars=self._TELEGRAM_REPLY_SOFT_LIMIT)
+        allow_markdown = len(chunks) == 1
+
+        for index, chunk in enumerate(chunks):
+            parse_mode = "Markdown" if allow_markdown and "*" in chunk else None
+            chunk_markup = reply_markup if index == 0 else None
+            try:
+                await source_message.reply_text(
+                    chunk,
+                    reply_markup=chunk_markup,
+                    parse_mode=parse_mode,
+                    reply_to_message_id=source_message.message_id,
+                )
+            except BadRequest:
+                await source_message.reply_text(
+                    chunk,
+                    reply_markup=chunk_markup,
+                    reply_to_message_id=source_message.message_id,
+                )
+
+    @staticmethod
+    def _split_reply_chunks(reply: str, *, max_chars: int) -> list[str]:
+        text = (reply or "").strip()
+        if not text:
+            return [""]
+        if len(text) <= max_chars:
+            return [text]
+
+        paragraphs = [part.strip() for part in text.split("\n\n") if part.strip()]
+        if not paragraphs:
+            paragraphs = [text]
+
+        chunks: list[str] = []
+        current = ""
+
+        for paragraph in paragraphs:
+            candidate = paragraph if not current else f"{current}\n\n{paragraph}"
+            if len(candidate) <= max_chars:
+                current = candidate
+                continue
+
+            if current:
+                chunks.append(current)
+                current = ""
+
+            tail = paragraph
+            while len(tail) > max_chars:
+                split_at = tail.rfind(" ", 0, max_chars)
+                if split_at < max_chars // 2:
+                    split_at = max_chars
+                piece = tail[:split_at].strip()
+                if piece:
+                    chunks.append(piece)
+                tail = tail[split_at:].strip()
+            current = tail
+
+        if current:
+            chunks.append(current)
+
+        return chunks or [text]
+
+    async def _send_thinking_message(self, source_message: Message) -> Message | None:
+        try:
+            return await source_message.reply_text(
+                "Думаю над ответом.....",
+                reply_to_message_id=source_message.message_id,
+            )
+        except BadRequest:
+            return None
+
+    async def _send_busy_message(self, source_message: Message, user_id: str) -> None:
+        async with self._active_users_lock:
+            if user_id in self._queued_busy_messages:
+                return
+            # Reserve a slot so concurrent updates do not emit duplicate busy replies.
+            self._queued_busy_messages[user_id] = []
+
+        try:
+            busy_message = await source_message.reply_text(
+                self._BUSY_MESSAGE,
+                reply_to_message_id=source_message.message_id,
+            )
+            async with self._active_users_lock:
+                self._queued_busy_messages.setdefault(user_id, []).append(busy_message)
+        except BadRequest:
+            async with self._active_users_lock:
+                if not self._queued_busy_messages.get(user_id):
+                    self._queued_busy_messages.pop(user_id, None)
+            return
+
+    async def _try_begin_user_processing(self, user_id: str) -> bool:
+        async with self._active_users_lock:
+            if user_id in self._active_users:
+                return False
+            self._active_users.add(user_id)
+            return True
+
+    async def _finish_user_processing(self, user_id: str) -> None:
+        queued_messages: list[Message] = []
+        async with self._active_users_lock:
+            self._active_users.discard(user_id)
+            queued_messages = self._queued_busy_messages.pop(user_id, [])
+
+        for message in queued_messages:
+            await self._dismiss_pending_message(message)
+
+    async def _dismiss_pending_message(self, pending_message: Message) -> None:
+        try:
+            await pending_message.delete()
+        except BadRequest:
+            return
+
+    async def _replace_pending_with_reply(
+        self,
+        pending_message: Message,
+        reply: str,
+        *,
+        reply_markup=None,
+    ) -> bool:
+        if reply_markup is not None:
+            return False
+
+        parse_mode = "Markdown" if "*" in reply else None
+        try:
+            await pending_message.edit_text(reply, parse_mode=parse_mode)
+            return True
+        except BadRequest:
+            if parse_mode is None:
+                return False
+
+        try:
+            await pending_message.edit_text(reply)
+            return True
+        except BadRequest:
+            return False
+
+    def _should_show_thinking(self, session, user_text: str) -> bool:
+        if not session.onboarding_completed:
+            return False
+
+        normalized = self._normalize_menu_text(user_text)
+        if session.menu_active and normalized in self._menu_labels:
+            return False
+
+        return True
+
+    @staticmethod
+    def _normalize_menu_text(text: str) -> str:
+        return " ".join(text.lower().split())
+
+    @staticmethod
+    def _event_timestamp(source_message: Message) -> float | None:
+        if source_message.date is None:
+            return None
+        return source_message.date.timestamp()
+
+    def _build_polling_lock(self) -> ProcessLock:
+        token = self._settings.telegram_token or ""
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+        lock_path = Path(gettempdir()) / f"demi_consultant.telegram.{token_hash}.lock"
+        return ProcessLock(lock_path)
+
+    async def run_polling(self) -> None:
+        self._register_handlers()
+        lock = self._build_polling_lock()
+        try:
+            lock.acquire()
+        except ProcessLockError:
+            logger.error("Telegram polling already running for this bot token; duplicate instance stopped")
+            return
+
+        stop_polling_event = asyncio.Event()
+        conflict_seen = False
+
+        def polling_error_callback(exc: TelegramError) -> None:
+            nonlocal conflict_seen
+            if isinstance(exc, Conflict):
+                if not conflict_seen:
+                    conflict_seen = True
+                    logger.error(
+                        "Polling conflict: another getUpdates client is active; stopping this instance"
+                    )
+                stop_polling_event.set()
+                return
+
+            logger.exception("Exception happened while polling for updates.", exc_info=exc)
+
+        await self._application.initialize()
+        await self._application.start()
+        try:
+            if self._application.updater is None:
+                raise RuntimeError("Telegram updater is not available")
+            await self._application.updater.start_polling(
+                drop_pending_updates=False,
+                error_callback=polling_error_callback,
+            )
+            await stop_polling_event.wait()
+        finally:
+            try:
+                if self._application.updater is not None:
+                    await self._application.updater.stop()
+            finally:
+                await self._application.stop()
+                await self._application.shutdown()
+                lock.release()

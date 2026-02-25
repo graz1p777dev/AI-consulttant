@@ -1,0 +1,1 @@
+"""Demi Konsultant shared package."""

@@ -1,0 +1,22 @@
+{
+  "whitelist": [
+    "niacinamide",
+    "azelaic acid",
+    "salicylic acid",
+    "lactic acid",
+    "retinal",
+    "retinol",
+    "ceramides",
+    "peptides",
+    "vitamin c",
+    "hyaluronic acid",
+    "panthenol",
+    "spf"
+  ],
+  "blacklist": [
+    "high fragrance load",
+    "harsh alcohol denat in leave-on",
+    "unknown bleaching complexes",
+    "unlabeled essential oil mixes"
+  ]
+}
