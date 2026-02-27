@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import hashlib
 import logging
+import re
 from pathlib import Path
 from tempfile import gettempdir
+from time import monotonic
 
 from telegram import Message, ReplyKeyboardRemove, Update
 from telegram.error import BadRequest, Conflict, TelegramError
@@ -17,25 +20,19 @@ from demi_consultant.core.exceptions import ProcessLockError
 from demi_consultant.core.logger import log_extra
 from demi_consultant.core.process_lock import ProcessLock
 from demi_consultant.services.consultation_service import ConsultationService
+from demi_consultant.services.localization import menu_labels_normalized, normalize_language, text as tr
 from demi_consultant.transport.base_channel_adapter import BaseChannelAdapter
 from demi_consultant.transport.telegram.handlers.error_handler import global_error_handler
 from demi_consultant.transport.telegram.handlers.start_handler import StartHandler
-from demi_consultant.transport.telegram.keyboards.main import (
-    BUTTON_AI_CONSULTATION,
-    BUTTON_PROBLEM_SOLVING,
-    BUTTON_SKIN_TYPE,
-    build_main_keyboard,
-)
+from demi_consultant.transport.telegram.keyboards.main import build_language_keyboard, build_main_keyboard
 
 logger = logging.getLogger(__name__)
 
 
 class TelegramCosmoBot(BaseChannelAdapter):
-    _BUSY_MESSAGE = (
-        "Секунду, пожалуйста 🤍\n"
-        "Я сейчас завершаю ответ на предыдущий вопрос и сразу продолжу диалог."
-    )
     _TELEGRAM_REPLY_SOFT_LIMIT = 3900
+    _BOLD_MARKER_PATTERN = re.compile(r"\*([^*\n]+)\*")
+    _START_DEDUP_WINDOW_SECONDS = 1.5
 
     def __init__(self, settings: Settings, consultation_service: ConsultationService) -> None:
         if not settings.telegram_token:
@@ -43,14 +40,9 @@ class TelegramCosmoBot(BaseChannelAdapter):
 
         self._settings = settings
         self._consultation_service = consultation_service
-        self._keyboard = build_main_keyboard()
-        self._menu_labels = {
-            self._normalize_menu_text(BUTTON_AI_CONSULTATION),
-            self._normalize_menu_text(BUTTON_SKIN_TYPE),
-            self._normalize_menu_text(BUTTON_PROBLEM_SOLVING),
-        }
         self._active_users: set[str] = set()
         self._queued_busy_messages: dict[str, list[Message]] = {}
+        self._last_start_events: dict[str, tuple[int, float]] = {}
         self._active_users_lock = asyncio.Lock()
 
         self._application = (
@@ -98,15 +90,25 @@ class TelegramCosmoBot(BaseChannelAdapter):
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.effective_user is None:
             return
+        if update.message is None:
+            return
 
         user_id = str(update.effective_user.id)
+        now = monotonic()
+        message_id = update.message.message_id
+        last_start = self._last_start_events.get(user_id)
+        if last_start is not None:
+            last_message_id, last_ts = last_start
+            if message_id == last_message_id:
+                return
+            if now - last_ts < self._START_DEDUP_WINDOW_SECONDS:
+                return
+        self._last_start_events[user_id] = (message_id, now)
+
         session = self._consultation_service.get_session(user_id)
         if session.onboarding_completed:
-            if update.message is None:
-                return
             await update.message.reply_text(
-                "Рада снова Вас видеть 🤍\n"
-                "Можем продолжить консультацию: опишите, что сейчас беспокоит по коже.",
+                tr("start_returning_user", session.language),
                 reply_to_message_id=update.message.message_id,
             )
             return
@@ -126,12 +128,12 @@ class TelegramCosmoBot(BaseChannelAdapter):
 
         acquired = await self._try_begin_user_processing(user_id)
         if not acquired:
-            await self._send_busy_message(source_message, user_id)
+            await self._send_busy_message(source_message, user_id, session_before.language)
             return
 
         try:
             if self._should_show_thinking(session_before, text):
-                pending_message = await self._send_thinking_message(source_message)
+                pending_message = await self._send_thinking_message(source_message, session_before.language)
 
             try:
                 reply = await self.handle_text(
@@ -145,7 +147,7 @@ class TelegramCosmoBot(BaseChannelAdapter):
                     exc,
                     extra=log_extra(channel="telegram", user_id=user_id),
                 )
-                reply = "Вижу техническую ошибку. Попробуйте через минуту."
+                reply = tr("technical_error", session_before.language)
 
             if not reply:
                 if pending_message is not None:
@@ -181,12 +183,12 @@ class TelegramCosmoBot(BaseChannelAdapter):
 
         acquired = await self._try_begin_user_processing(user_id)
         if not acquired:
-            await self._send_busy_message(source_message, user_id)
+            await self._send_busy_message(source_message, user_id, session_before.language)
             return
 
         try:
             if session_before.onboarding_completed:
-                pending_message = await self._send_thinking_message(source_message)
+                pending_message = await self._send_thinking_message(source_message, session_before.language)
 
             photo = source_message.photo[-1]
             photo_file = await photo.get_file()
@@ -207,7 +209,7 @@ class TelegramCosmoBot(BaseChannelAdapter):
                     exc,
                     extra=log_extra(channel="telegram", user_id=user_id),
                 )
-                reply = "Вижу техническую ошибку. Попробуйте через минуту."
+                reply = tr("technical_error", session_before.language)
 
             if not reply:
                 if pending_message is not None:
@@ -226,12 +228,16 @@ class TelegramCosmoBot(BaseChannelAdapter):
                 await self._finish_user_processing(user_id)
 
     def _select_reply_markup(self, session, user_text: str):
+        if not session.onboarding_completed and session.onboarding_step == "language":
+            return build_language_keyboard()
+
         if session.menu_active and not session.menu_shown_once:
             session.menu_shown_once = True
-            return self._keyboard
+            return build_main_keyboard(normalize_language(session.language))
 
         normalized = self._normalize_menu_text(user_text)
-        if session.menu_active and normalized in self._menu_labels:
+        menu_labels = menu_labels_normalized(session.language)
+        if session.menu_active and normalized in menu_labels:
             session.menu_active = False
             return ReplyKeyboardRemove()
 
@@ -239,16 +245,15 @@ class TelegramCosmoBot(BaseChannelAdapter):
 
     async def _send_reply(self, source_message: Message, reply: str, reply_markup=None) -> None:
         chunks = self._split_reply_chunks(reply, max_chars=self._TELEGRAM_REPLY_SOFT_LIMIT)
-        allow_markdown = len(chunks) == 1
 
         for index, chunk in enumerate(chunks):
-            parse_mode = "Markdown" if allow_markdown and "*" in chunk else None
+            html_chunk = self._to_telegram_html(chunk)
             chunk_markup = reply_markup if index == 0 else None
             try:
                 await source_message.reply_text(
-                    chunk,
+                    html_chunk,
                     reply_markup=chunk_markup,
-                    parse_mode=parse_mode,
+                    parse_mode="HTML",
                     reply_to_message_id=source_message.message_id,
                 )
             except BadRequest:
@@ -257,6 +262,22 @@ class TelegramCosmoBot(BaseChannelAdapter):
                     reply_markup=chunk_markup,
                     reply_to_message_id=source_message.message_id,
                 )
+
+    @classmethod
+    def _to_telegram_html(cls, text: str) -> str:
+        if not text:
+            return ""
+        fragments: list[str] = []
+        cursor = 0
+        for match in cls._BOLD_MARKER_PATTERN.finditer(text):
+            start, end = match.span()
+            if start > cursor:
+                fragments.append(html.escape(text[cursor:start]))
+            fragments.append(f"<b>{html.escape(match.group(1))}</b>")
+            cursor = end
+        if cursor < len(text):
+            fragments.append(html.escape(text[cursor:]))
+        return "".join(fragments)
 
     @staticmethod
     def _split_reply_chunks(reply: str, *, max_chars: int) -> list[str]:
@@ -299,16 +320,16 @@ class TelegramCosmoBot(BaseChannelAdapter):
 
         return chunks or [text]
 
-    async def _send_thinking_message(self, source_message: Message) -> Message | None:
+    async def _send_thinking_message(self, source_message: Message, language: str | None) -> Message | None:
         try:
             return await source_message.reply_text(
-                "Думаю над ответом.....",
+                tr("thinking_message", language),
                 reply_to_message_id=source_message.message_id,
             )
         except BadRequest:
             return None
 
-    async def _send_busy_message(self, source_message: Message, user_id: str) -> None:
+    async def _send_busy_message(self, source_message: Message, user_id: str, language: str | None) -> None:
         async with self._active_users_lock:
             if user_id in self._queued_busy_messages:
                 return
@@ -317,7 +338,7 @@ class TelegramCosmoBot(BaseChannelAdapter):
 
         try:
             busy_message = await source_message.reply_text(
-                self._BUSY_MESSAGE,
+                tr("busy_message", language),
                 reply_to_message_id=source_message.message_id,
             )
             async with self._active_users_lock:
@@ -360,16 +381,9 @@ class TelegramCosmoBot(BaseChannelAdapter):
         if reply_markup is not None:
             return False
 
-        parse_mode = "Markdown" if "*" in reply else None
+        html_reply = self._to_telegram_html(reply)
         try:
-            await pending_message.edit_text(reply, parse_mode=parse_mode)
-            return True
-        except BadRequest:
-            if parse_mode is None:
-                return False
-
-        try:
-            await pending_message.edit_text(reply)
+            await pending_message.edit_text(html_reply, parse_mode="HTML")
             return True
         except BadRequest:
             return False
@@ -379,7 +393,7 @@ class TelegramCosmoBot(BaseChannelAdapter):
             return False
 
         normalized = self._normalize_menu_text(user_text)
-        if session.menu_active and normalized in self._menu_labels:
+        if session.menu_active and normalized in menu_labels_normalized(session.language):
             return False
 
         return True

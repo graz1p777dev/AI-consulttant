@@ -4,6 +4,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from demi_consultant.services.onboarding_service import OnboardingService
+from demi_consultant.transport.telegram.keyboards.main import build_language_keyboard
 
 
 class StartHandler:
@@ -13,5 +14,6 @@ class StartHandler:
 
         await update.message.reply_text(
             OnboardingService.START_MESSAGE,
+            reply_markup=build_language_keyboard(),
             reply_to_message_id=update.message.message_id,
         )

@@ -4,7 +4,10 @@ from dataclasses import dataclass
 import re
 from time import time
 
+from langdetect import LangDetectException, detect
+
 from demi_consultant.core.config import Settings
+from demi_consultant.services.localization import text as tr
 from demi_consultant.state.user_session import UserSession
 from demi_consultant.transport.rate_limit import RateLimiter
 
@@ -19,19 +22,41 @@ class InputGuardDecision:
 
 
 class InteractionGuardService:
+    _ALLOWED_LANGUAGES = {"ru", "en", "ky"}
     _repeat_chars_pattern = re.compile(r"(.)\1{6,}")
     _only_punctuation_pattern = re.compile(r"^[\W_]+$", re.UNICODE)
     _only_emoji_pattern = re.compile(r"^[\U0001F300-\U0001FAFF\u2600-\u27BF\s]+$")
+    _letters_only_long_pattern = re.compile(r"^[a-zA-Z]{15,}$")
+    _many_digits_pattern = re.compile(r"\d{5,}")
+    _many_same_chars_pattern = re.compile(r"(.)\1{5,}")
+    _many_non_letters_pattern = re.compile(r"[^a-zA-Zа-яА-ЯёЁңүөҢҮӨ\s]{4,}")
+    _long_consonant_cluster_pattern = re.compile(r"[bcdfghjklmnpqrstvwxyzйцкнгшщзхъфвпрлджчсмтб]{7,}", re.IGNORECASE)
+    _language_chars_pattern = re.compile(r"^[a-zA-Zа-яА-ЯёЁңүөҢҮӨ\s.,!?;:'\"()\-]+$")
+    _letter_pattern = re.compile(r"[a-zA-Zа-яА-ЯёЁңүөҢҮӨ]")
+    _token_pattern = re.compile(r"[a-zA-Zа-яА-ЯёЁңүөҢҮӨ0-9]+")
+    _keyboard_mash_markers = (
+        "qwerty",
+        "asdf",
+        "zxcv",
+        "йцукен",
+        "фыва",
+        "ячсм",
+        "12345",
+        "54321",
+    )
 
     _low_value_messages = {
         "ок",
         "ok",
+        "okay",
         "понял",
         "поняла",
         "понятно",
         "спасибо",
         "thanks",
         "thank you",
+        "рахмат",
+        "чоң рахмат",
         "ясно",
     }
 
@@ -57,9 +82,10 @@ class InteractionGuardService:
         if len(text) > self._settings.max_user_text_length:
             return InputGuardDecision(
                 allowed=False,
-                response=(
-                    "Сообщение слишком длинное.\n"
-                    f"Пожалуйста, опишите вопрос кратко (до {self._settings.max_user_text_length} символов)."
+                response=tr(
+                    "text_too_long",
+                    session.language,
+                    limit=self._settings.max_user_text_length,
                 ),
             )
 
@@ -94,19 +120,19 @@ class InteractionGuardService:
         if self._is_meaningless(normalized):
             return InputGuardDecision(
                 allowed=False,
-                response=(
-                    "Похоже, сообщение не распознано.\n"
-                    "Опишите вопрос текстом — помогу разобраться."
-                ),
+                response=tr("meaningless", session.language),
             )
 
         if normalized in self._low_value_messages:
             return InputGuardDecision(
                 allowed=False,
-                response=(
-                    "Пожалуйста 🤍\n"
-                    "Если появятся вопросы по коже — я рядом."
-                ),
+                response=tr("low_value", session.language),
+            )
+
+        if not self._input_guard(text):
+            return InputGuardDecision(
+                allowed=False,
+                response=tr("meaningless", session.language),
             )
 
         return InputGuardDecision(
@@ -133,36 +159,36 @@ class InteractionGuardService:
         if len(caption) > self._settings.max_user_text_length:
             return InputGuardDecision(
                 allowed=False,
-                response=(
-                    "Сообщение слишком длинное.\n"
-                    f"Пожалуйста, сократите подпись к фото до {self._settings.max_user_text_length} символов."
+                response=tr(
+                    "caption_too_long",
+                    session.language,
+                    limit=self._settings.max_user_text_length,
                 ),
             )
 
         if session.images_in_session >= self._settings.max_images_per_session:
             return InputGuardDecision(
                 allowed=False,
-                response=(
-                    "Давайте остановимся на текущем фото,\n"
-                    "я уже могу дать рекомендации."
-                ),
+                response=tr("images_limit", session.language),
             )
 
         if session.last_image_at and now - session.last_image_at < self._settings.image_rate_limit_seconds:
             return InputGuardDecision(
                 allowed=False,
-                response=(
-                    "Фото приходят слишком часто.\n"
-                    f"Отправляйте не чаще 1 фото в {self._settings.image_rate_limit_seconds} секунд."
+                response=tr(
+                    "image_rate_limit",
+                    session.language,
+                    seconds=self._settings.image_rate_limit_seconds,
                 ),
             )
 
         if image_size > self._settings.max_image_size_bytes:
             return InputGuardDecision(
                 allowed=False,
-                response=(
-                    "Файл слишком большой.\n"
-                    f"Максимальный размер: {self._settings.max_image_size_mb} MB."
+                response=tr(
+                    "image_size_limit",
+                    session.language,
+                    mb=self._settings.max_image_size_mb,
                 ),
             )
 
@@ -222,6 +248,118 @@ class InteractionGuardService:
         if self._only_emoji_pattern.fullmatch(normalized_text):
             return True
         return False
+
+    def _looks_like_garbage(self, text: str) -> bool:
+        normalized = text.strip()
+        if len(normalized) < 3:
+            return True
+        if len(normalized) > 12 and " " not in normalized:
+            return True
+        if self._many_digits_pattern.search(normalized):
+            return True
+        if self._many_same_chars_pattern.search(normalized):
+            return True
+        if self._letters_only_long_pattern.fullmatch(normalized):
+            return True
+        lowered = normalized.lower()
+        if any(marker in lowered for marker in self._keyboard_mash_markers):
+            return True
+        if self._many_non_letters_pattern.search(normalized):
+            return True
+        if self._long_consonant_cluster_pattern.search(lowered):
+            return True
+        if self._has_low_letter_density(normalized):
+            return True
+        if self._has_unstable_tokens(normalized):
+            return True
+        return False
+
+    @staticmethod
+    def _has_vowels(text: str) -> bool:
+        vowels = "аеёиоуыэюяaeiouөү"
+        return any(char in vowels for char in text.lower())
+
+    def _has_language_like_text(self, text: str) -> bool:
+        normalized = text.strip()
+        if not normalized:
+            return False
+        if not self._language_chars_pattern.fullmatch(normalized):
+            return False
+        letters = self._letter_pattern.findall(normalized)
+        if len(letters) < 2:
+            return False
+        letter_ratio = len(letters) / max(len(normalized), 1)
+        if letter_ratio < 0.45:
+            return False
+        tokens = [token for token in self._token_pattern.findall(normalized.lower()) if token]
+        if not tokens:
+            return False
+        # Avoid random single-token mash: requires at least one meaningful token profile.
+        meaningful_tokens = sum(1 for token in tokens if len(token) <= 14 and self._token_vowel_ratio(token) >= 0.2)
+        return meaningful_tokens >= 1
+
+    @classmethod
+    def _has_language(cls, text: str) -> bool:
+        try:
+            return detect(text) in cls._ALLOWED_LANGUAGES
+        except LangDetectException:
+            return False
+
+    def _input_guard(self, text: str) -> bool:
+        if self._looks_like_garbage(text):
+            return False
+        if not self._has_vowels(text):
+            return False
+        if self._is_strict_garbage(text):
+            return False
+        if not self._has_language(text) and not self._has_language_like_text(text):
+            return False
+        return True
+
+    def _is_strict_garbage(self, text: str) -> bool:
+        normalized = " ".join(text.lower().split()).strip()
+        if not normalized:
+            return True
+        tokens = [token for token in self._token_pattern.findall(normalized) if token]
+        if not tokens:
+            return True
+        if len(tokens) == 1:
+            token = tokens[0]
+            if len(token) >= 10 and self._token_vowel_ratio(token) < 0.22:
+                return True
+            if len(token) >= 12 and token.isalpha():
+                return True
+        short_noise = sum(1 for token in tokens if len(token) <= 2)
+        if short_noise >= max(3, len(tokens) // 2 + 1):
+            return True
+        return False
+
+    @classmethod
+    def _has_low_letter_density(cls, text: str) -> bool:
+        letters = cls._letter_pattern.findall(text)
+        if not text:
+            return True
+        return (len(letters) / len(text)) < 0.30
+
+    def _has_unstable_tokens(self, text: str) -> bool:
+        tokens = [token for token in self._token_pattern.findall(text.lower()) if token]
+        if not tokens:
+            return True
+        bad = 0
+        for token in tokens:
+            if len(token) >= 9 and self._token_vowel_ratio(token) < 0.2:
+                bad += 1
+            elif len(token) >= 12 and token.isalpha():
+                bad += 1
+        return bad >= 2 or (len(tokens) == 1 and bad == 1)
+
+    @staticmethod
+    def _token_vowel_ratio(token: str) -> float:
+        vowels = "аеёиоуыэюяaeiouөү"
+        if not token:
+            return 0.0
+        vowel_count = sum(1 for ch in token if ch in vowels)
+        return vowel_count / len(token)
 
     @staticmethod
     def _normalize(text: str) -> str:

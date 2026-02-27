@@ -2,17 +2,32 @@ from __future__ import annotations
 
 from telegram import ReplyKeyboardMarkup
 
-BUTTON_AI_CONSULTATION = "🔘 Консультация"
-BUTTON_SKIN_TYPE = "🔘 Определить тип кожи"
-BUTTON_PROBLEM_SOLVING = "🔘 Разобрать проблему"
+from demi_consultant.services.localization import LANGUAGE_BUTTONS, menu_buttons
+
+BUTTON_AI_CONSULTATION = menu_buttons("ru")[0]
+BUTTON_SKIN_TYPE = menu_buttons("ru")[1]
+BUTTON_PROBLEM_SOLVING = menu_buttons("ru")[2]
 
 
-def build_main_keyboard() -> ReplyKeyboardMarkup:
+def build_language_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [BUTTON_AI_CONSULTATION],
-            [BUTTON_SKIN_TYPE],
-            [BUTTON_PROBLEM_SOLVING],
+            [LANGUAGE_BUTTONS["ru"]],
+            [LANGUAGE_BUTTONS["en"]],
+            [LANGUAGE_BUTTONS["kg"]],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def build_main_keyboard(language: str = "ru") -> ReplyKeyboardMarkup:
+    consultation, skin_type, problem = menu_buttons(language)
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [consultation],
+            [skin_type],
+            [problem],
         ],
         resize_keyboard=True,
         one_time_keyboard=True,

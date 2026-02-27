@@ -1,54 +1,85 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from demi_consultant.knowledge.knowledge_loader import KnowledgeBundle
+from demi_consultant.services.localization import language_instruction, language_name, normalize_language
 from demi_consultant.state.fsm import ChatMode
 from demi_consultant.state.user_session import UserSession
 
-CORE_IDENTITY = """
-Вы — AI косметолог-консультант магазина уходовой косметики Demi Results.
-
-Роль и границы:
-- Только кожа, уход, ингредиенты, составы косметики.
-- Никаких оффтоп-тем (ПК, политика, философия и т.д.).
-- Никаких диагнозов; объясняйте просто и профессионально.
-
-Тон:
-- Уважительно, на "Вы", без фамильярности.
-- Тепло и спокойно, без навязчивых продаж.
+BASE_IDENTITY_PROMPT = """
+Вы — AI косметолог-консультант Demi Results.
+Только skincare: кожа, уход, ингредиенты и составы.
+Без диагнозов, без оффтопа, без legacy-тем про ПК.
+Тон: уважительно на «Вы», спокойно, профессионально, без давления.
 """.strip()
 
 SAFETY_RULES = """
-Достоверность:
-- Не додумывайте симптомы, которых пользователь не называл.
-- Без фото нельзя делать визуальные утверждения.
-- При нехватке данных пишите мягко: "возможно", "чаще всего", "по описанию".
-- Если пользователь сомневается: не спорьте, признайте ограниченность данных, предложите уточнение.
-- Не делайте выводы по типу кожи только из возраста.
-- Лучше честность, чем уверенность без данных.
+Без фото не делайте визуальных выводов.
+Не додумывайте симптомы, которых не было в тексте.
+При нехватке данных пишите мягко: «возможно», «чаще всего».
+Если пользователь сомневается — не спорьте, признайте ограничения и уточните данные.
+Лучше честность, чем уверенность без данных.
+Никогда не называйте бренды и марки косметики, только категории и состав/активы.
 """.strip()
 
 STYLE_RULES = """
-Формат ответа:
-- 1 короткая реакция по смыслу реплики пользователя.
-- Далее: краткое объяснение, практический шаг, мягкое завершение.
-- Отвечайте как в мессенджере, не как статья.
-- Короткие абзацы, 6-8 строк по умолчанию, без длинных списков.
-- 1-2 эмодзи максимум, без markdown-перегруза.
-- Избегайте шаблонов вроде "Основной ответ", "Вероятный тип".
+Формат как в мессенджере: короткие абзацы и живой ритм.
+Сначала реакция по смыслу, затем суть и практический шаг.
+Без канцелярита, лекций и шаблонных заголовков.
+Списки и таблицы только если пользователь попросил.
+
+Длина ответа:
+— Отвечайте кратко и по делу.
+— Цель: формат живого мессенджера, не статьи.
+— 4–8 строк в большинстве случаев.
+— Максимум 120–150 слов.
+— Не давать длинные лекции без запроса пользователя.
+— Если тема сложная: дайте короткую суть, предложите углубиться по желанию.
+— Принцип: сначала кратко → глубже только если попросят.
+
+Стратегия ответа:
+— Сначала короткий полезный ответ.
+— Затем (опционально) 1 мягкое предложение продолжить.
+— Не перечисляйте длинные списки без запроса.
+— Не делайте много подпунктов.
+
+Если можно ответить проще — отвечайте проще.
+
+Запрещено:
+— академический стиль
+— длинные методички
+— многоуровневые списки
+— ощущение статьи
+""".strip()
+
+EMOTIONALITY_RULES = """
+Добавляйте лёгкую эмоциональность в ответы:
+— тёплый тон
+— спокойная поддержка
+— человеческие формулировки
+
+Иногда можно:
+— короткое эмодзи (не всегда)
+— мягкие слова поддержки
+— живые переходы
+
+Но:
+— без инфантилизма
+— без перегиба
+— без «солнышко зайчик»
+— не в каждом ответе
 """.strip()
 
 TECHNICAL_QUALITY_RULES = """
-Technical quality:
-— избегайте обрывов и рваных фраз
-— не оставляйте broken chunks
-— финальный ответ должен быть цельным и чистым по тексту
+Technical quality: финальный текст должен быть цельным, без обрывов и broken chunks.
 """.strip()
 
-SHORT_STYLE_RULES = "\n".join(
-    STYLE_RULES.splitlines()[: max(1, len(STYLE_RULES.splitlines()) // 2)]
-).strip()
+SHORT_STYLE_RULES = """
+Короткий ответ в чат-формате: по делу, без лекции.
+Одна мысль на абзац.
+""".strip()
 
 CONFIDENCE_LOW_BLOCK = """
 Confidence mode:
@@ -59,7 +90,7 @@ Confidence mode:
 
 
 def _compose_base_prompt(style_block: str) -> str:
-    return "\n\n".join([CORE_IDENTITY, SAFETY_RULES, style_block]).strip()
+    return "\n\n".join([BASE_IDENTITY_PROMPT, SAFETY_RULES, style_block, EMOTIONALITY_RULES]).strip()
 
 
 BASE_PROMPT = _compose_base_prompt(STYLE_RULES)
@@ -118,7 +149,7 @@ def build_system_prompt(
     mode: ChatMode,
     session: UserSession,
     knowledge: KnowledgeBundle,
-    runtime_guidance: str | None = None,
+    runtime_guidance: str | dict[str, Any] | None = None,
 ) -> str:
     runtime_text, runtime_flags = _parse_runtime_guidance(runtime_guidance)
     style_block = _select_style_block(mode, session)
@@ -141,9 +172,11 @@ def build_system_prompt(
 
     profile_block = "\n".join(
         [
+            f"Язык: {language_name(session.language)} ({normalize_language(session.language)})",
             f"Имя: {_safe_text(session.name, fallback='не указано', max_len=24)}",
             f"Возраст: {session.age if session.age is not None else 'не указан'}",
             f"Тип кожи: {_safe_text(session.skin_type, fallback='не указан', max_len=20)}",
+            f"Сообщений в консультации: {session.consultation_turns}",
             f"Жалобы: {_safe_join(concerns_items, limit=1)}",
             f"Аллергии: {_safe_join(allergy_items, limit=1)}",
             f"Последние рекомендации: {_safe_join(recommendation_items, limit=2)}",
@@ -167,12 +200,13 @@ def build_system_prompt(
     age_block = _age_adaptation_block(session.age_range)
 
     conversion_block = (
-        "Conversion awareness:\n"
-        "- Предлагайте подбор ухода только при явном интересе к покупке.\n"
-        "- Менеджера предлагайте только при вопросах о наличии/цене и без давления."
+        "Conversion awareness: первые 5 сообщений в консультации отвечайте без продажных CTA. "
+        "Начиная с 6-го можно мягко предложить подбор под бюджет одной фразой. "
+        "Если пользователь согласился, дайте контакт консультанта и шаг обращения. Без давления."
     )
 
-    parts = [base_prompt, mode_block, conversion_block, profile_block]
+    language_block = language_instruction(session.language)
+    parts = [base_prompt, language_block, mode_block, conversion_block, profile_block]
     if mode == ChatMode.INGREDIENT_CHECK:
         parts.append(ingredients_block)
     if session.purchase_stage == "hot_lead":
@@ -236,7 +270,7 @@ def _safe_multiline_text(value: str | None, max_len: int = 900) -> str:
     return normalized.strip()[:max_len]
 
 
-def _parse_runtime_guidance(runtime_guidance: str | None) -> tuple[str, dict[str, str | bool]]:
+def _parse_runtime_guidance(runtime_guidance: str | dict[str, Any] | None) -> tuple[str, dict[str, str | bool]]:
     flags: dict[str, str | bool] = {
         "enable_soft_closing": False,
         "confidence": "",

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
+import os
 import re
 from time import perf_counter
 from typing import Any
@@ -16,8 +18,21 @@ from demi_consultant.knowledge.knowledge_loader import KnowledgeBundle
 from demi_consultant.services.context_intelligence_service import ContextIntelligenceService
 from demi_consultant.services.conversion_engine import ConversionEngine
 from demi_consultant.services.interaction_guard_service import InputGuardDecision, InteractionGuardService
+from demi_consultant.services.intent_router import IntentResult
+from demi_consultant.services.localization import (
+    all_soft_closings,
+    cta_starters,
+    fallback_by_mode,
+    language_instruction,
+    menu_buttons,
+    normalize_language,
+    soft_closings,
+    text as tr,
+)
 from demi_consultant.services.memory_service import MemoryService
 from demi_consultant.services.onboarding_service import OnboardingService
+from demi_consultant.services.reasoning_planner import Plan
+from demi_consultant.services.adaptive_response_engine import AdaptiveResponseEngine
 from demi_consultant.services.short_answer_cache import ShortAnswerCache
 from demi_consultant.services.skin_progress_service import SkinProgressService
 from demi_consultant.services.token_guard import TokenGuard
@@ -36,12 +51,33 @@ class ResponseTuning:
     low_confidence: bool
     simple_question: bool
     routine_request: bool
+    depth_level: str
+    intent: IntentResult
+    plan: Plan
 
 
 class ConsultationService:
     """Core domain service reused by Telegram/WhatsApp/Instagram adapters."""
 
     _EMOJI_PATTERN = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]")
+    _SMART_EMOJI_MAP: tuple[tuple[str, str], ...] = (
+        ("кожа", "✨"),
+        ("уход", "🧴"),
+        ("крем", "🧴"),
+        ("сыворотка", "💧"),
+        ("увлажнение", "💧"),
+        ("прыщи", "⚡"),
+        ("акне", "⚡"),
+        ("spf", "☀️"),
+        ("солнце", "☀️"),
+        ("рекомендация", "💡"),
+        ("совет", "💡"),
+        ("важно", "⚠️"),
+        ("ошибка", "⚠️"),
+        ("морщины", "🪞"),
+        ("глаза", "👀"),
+    )
+    _MAX_SMART_EMOJIS = 3
     _DOUBT_MARKERS: tuple[str, ...] = (
         "сомнева",
         "не уверен",
@@ -52,6 +88,13 @@ class ConsultationService:
         "может не",
         "не такая",
         "ошиб",
+        "not sure",
+        "i doubt",
+        "i'm not sure",
+        "maybe not",
+        "так эмес",
+        "ишенбейм",
+        "балким андай эмес",
     )
     _BEGINNER_MARKERS: tuple[str, ...] = (
         "не пользуюсь уходом",
@@ -112,6 +155,19 @@ class ConsultationService:
         "spf",
         "ретинол",
         "ниацинамид",
+        "skin",
+        "skincare",
+        "care",
+        "routine",
+        "ingredient",
+        "face",
+        "acne",
+        "pimple",
+        "dry",
+        "oily",
+        "тері",
+        "кам көрүү",
+        "курам",
     )
     _OFFTOPIC_MARKERS: tuple[str, ...] = (
         "политик",
@@ -147,6 +203,29 @@ class ConsultationService:
         "а?",
         "угу",
     )
+    _AFFIRMATIVE_MARKERS: tuple[str, ...] = (
+        "да",
+        "давайте",
+        "ок",
+        "окей",
+        "хочу",
+        "конечно",
+        "yes",
+        "sure",
+        "ok",
+        "yep",
+        "ооба",
+        "макул",
+    )
+    _NEGATIVE_MARKERS: tuple[str, ...] = (
+        "нет",
+        "не надо",
+        "не нужно",
+        "не сейчас",
+        "no",
+        "not now",
+        "жок",
+    )
     _COMPLAINT_MARKERS: tuple[str, ...] = (
         "у меня",
         "кожа",
@@ -167,6 +246,30 @@ class ConsultationService:
         "связаться с косметолог",
         "менеджер",
         "живой специалист",
+        "real cosmetologist",
+        "human specialist",
+        "store cosmetologist",
+        "менен байланыш",
+        "чыныгы косметолог",
+    )
+    _SPECIFIC_BRAND_REQUEST_MARKERS: tuple[str, ...] = (
+        "какие именно крем",
+        "какой именно крем",
+        "название крем",
+        "конкретный крем",
+        "марка крем",
+        "марки крем",
+        "бренд крем",
+        "какие бренды",
+        "какие марки",
+        "specific cream",
+        "exact cream",
+        "brand name",
+        "which brand",
+        "кайнсы крем",
+        "конкреттүү крем",
+        "бренд",
+        "марка",
     )
     _UNCERTAINTY_MARKERS: tuple[str, ...] = (
         "возможно",
@@ -350,6 +453,24 @@ class ConsultationService:
         "стоимость",
         "заказать",
         "оформить",
+        "buy",
+        "price",
+        "cost",
+        "in stock",
+        "order",
+        "купсам",
+        "баасы",
+        "барбы",
+        "заказ",
+        "какие средства",
+        "что взять",
+        "подберите уход",
+        "подобрать уход",
+        "what should i buy",
+        "what products",
+        "can you suggest products",
+        "эмне алуу",
+        "кандай каражат",
     )
 
     _MENU_CONSULTATION_LABELS = {
@@ -394,6 +515,8 @@ class ConsultationService:
         self._crm = crm_service
         self._knowledge = knowledge
         self._skin_progress = skin_progress_service
+        self._log_reasoning = self._env_flag("LOG_REASONING", default=False)
+        self._adaptive_response_engine = AdaptiveResponseEngine()
 
     def get_session(self, user_id: str) -> UserSession:
         return self._memory.get_or_create_session(user_id)
@@ -445,21 +568,38 @@ class ConsultationService:
                 return onboarding.reply
             return None
 
-        menu_reply = self._handle_menu_selection(user_id, text)
+        menu_reply = self._handle_menu_selection(session, user_id, text)
         if menu_reply:
             self._memory.remember_user_message(user_id, text)
             self._memory.remember_assistant_message(user_id, menu_reply)
             return menu_reply
 
+        handoff_reply = self._handle_pending_manager_confirmation(session, text)
+        if handoff_reply:
+            self._memory.remember_user_message(user_id, text)
+            self._memory.remember_assistant_message(user_id, handoff_reply)
+            return handoff_reply
+
+        if self._requests_specific_brands_or_products(text):
+            handoff = self._conversion_engine.escalate_to_human(session.language).strip()
+            self._memory.remember_user_message(user_id, text)
+            self._memory.remember_assistant_message(user_id, handoff)
+            session.purchase_stage = "hot_lead"
+            return handoff
+
         if self._is_strict_domain_offtopic(text):
-            redirect_reply = self._soft_domain_redirect(text)
+            redirect_reply = self._soft_domain_redirect(text, language=session.language)
             self._memory.remember_user_message(user_id, text)
             self._memory.remember_assistant_message(user_id, redirect_reply)
             return redirect_reply
 
         verdict = self._guardrails.validate_user_text(text)
         if not verdict.allowed:
-            redirect_reply = self._soft_domain_redirect(text, fallback=verdict.message)
+            redirect_reply = self._soft_domain_redirect(
+                text,
+                fallback=verdict.message,
+                language=session.language,
+            )
             self._memory.remember_user_message(user_id, text)
             self._memory.remember_assistant_message(user_id, redirect_reply)
             return redirect_reply
@@ -468,29 +608,66 @@ class ConsultationService:
 
         self._mark_consultation_started(user_id, session, channel)
         response_mode = self._resolve_response_mode(session, analysis_text)
+        intent = IntentResult(
+            intent_type="question",
+            confidence=0.5,
+            emotional_tone="neutral",
+            complexity="simple",
+        )
+        plan = Plan(
+            response_mode="educational",
+            reaction_type="neutral",
+            depth_level="short",
+            need_clarification=False,
+            risk_level="low",
+        )
+        tuning = self._default_response_tuning(intent=intent, plan=plan)
+        # TEMP: по запросу пользователя pre-pipeline отключен.
+        # intent = self._build_light_intent(analysis_text, session)
+        # session.last_intent = intent.intent_type
+        # plan = self._build_light_plan(
+        #     intent=intent,
+        #     session=session,
+        #     user_text=analysis_text,
+        #     has_photo=False,
+        # )
+        # adaptive_profile = self._adaptive_response_engine.choose(text, session, intent)
+
+        # TEMP: intent-based off-topic router disabled вместе с pre-pipeline.
+        # if intent.intent_type == "off_topic":
+        #     redirect_reply = self._soft_domain_redirect(text, language=session.language)
+        #     self._memory.remember_user_message(user_id, text)
+        #     self._memory.remember_assistant_message(user_id, redirect_reply)
+        #     return redirect_reply
 
         if self._should_close_follow_up(session, text):
             self._memory.remember_user_message(user_id, text)
-            close_reply = "Если появятся вопросы по коже — я рядом 🤍"
+            close_reply = tr("close_follow_up", session.language)
             self._memory.remember_assistant_message(user_id, close_reply)
             return close_reply
 
         session = self._memory.remember_user_message(user_id, text)
+        session.consultation_turns += 1
         self._capture_profile_signals(user_id, session, analysis_text, channel)
-        tuning = self._build_response_tuning(
-            session=session,
-            user_text=analysis_text,
-            source_user_text=text,
-            mode=response_mode,
-            has_photo=False,
-        )
+        # TEMP: по запросу пользователя pre-pipeline отключен.
+        # tuning = self._build_response_tuning(
+        #     session=session,
+        #     user_text=analysis_text,
+        #     source_user_text=text,
+        #     mode=response_mode,
+        #     has_photo=False,
+        #     intent=intent,
+        #     plan=plan,
+        #     adaptive_profile=adaptive_profile,
+        # )
+        if self._log_reasoning:
+            self._log_reasoning_snapshot("text", user_id, intent, plan, tuning, channel=channel)
+
         if self._is_progress_follow_up(text) and len(session.progress_photos) < 2:
             progress_reply = self._finalize_reply(
                 response_mode,
                 text,
-                "Понимаю Ваш вопрос о динамике кожи.\n\n"
-                "Чтобы оценить изменения точнее, нужен ориентир: фото «до» и текущее фото в похожем свете.\n\n"
-                "Если хотите, отправьте новое фото, и я кратко сравню, что изменилось.",
+                tr("progress_need_photos", session.language),
                 session,
                 has_photo=False,
                 short_mode=tuning.short_mode,
@@ -498,6 +675,8 @@ class ConsultationService:
                 low_confidence=tuning.low_confidence,
                 simple_question=tuning.simple_question,
                 routine_request=tuning.routine_request,
+                intent=tuning.intent,
+                plan=tuning.plan,
             )
             self._memory.remember_assistant_message(user_id, progress_reply)
             return progress_reply
@@ -515,6 +694,8 @@ class ConsultationService:
                 low_confidence=tuning.low_confidence,
                 simple_question=tuning.simple_question,
                 routine_request=tuning.routine_request,
+                intent=tuning.intent,
+                plan=tuning.plan,
             )
             final_cached = self._apply_conversion(user_id, session, text, final_cached, channel)
             self._memory.remember_assistant_message(user_id, final_cached)
@@ -524,11 +705,20 @@ class ConsultationService:
         history = self._token_guard.trim_history(self._memory.get_context_history(user_id), session)
         payload = [{"role": turn.role, "content": turn.content} for turn in history]
 
+        runtime_guidance = ""
+        # TEMP: по запросу пользователя pre-pipeline отключен.
+        # runtime_guidance = self._compose_runtime_guidance(
+        #     runtime_guidance=tuning.runtime_guidance,
+        #     intent=tuning.intent,
+        #     plan=tuning.plan,
+        #     thoughts=None,
+        # )
+
         system_prompt = build_system_prompt(
             response_mode,
             session,
             self._knowledge,
-            runtime_guidance=tuning.runtime_guidance,
+            runtime_guidance=runtime_guidance,
         )
 
         max_tokens, verbosity = self._response_profile(
@@ -537,6 +727,7 @@ class ConsultationService:
             safety,
             short_mode=tuning.short_mode,
             beginner_mode=tuning.beginner_mode,
+            depth_level=tuning.depth_level,
         )
 
         try:
@@ -553,7 +744,7 @@ class ConsultationService:
                 exc,
                 extra=log_extra(channel=channel, user_id=user_id, started_at=started_at),
             )
-            safe_reply = self._technical_pause_fallback()
+            safe_reply = self._technical_pause_fallback(session)
 
         final_reply = self._finalize_reply(
             response_mode,
@@ -566,6 +757,8 @@ class ConsultationService:
             low_confidence=tuning.low_confidence,
             simple_question=tuning.simple_question,
             routine_request=tuning.routine_request,
+            intent=tuning.intent,
+            plan=tuning.plan,
         )
         final_reply = self._apply_conversion(user_id, session, text, final_reply, channel)
         self._memory.remember_assistant_message(user_id, final_reply)
@@ -609,22 +802,52 @@ class ConsultationService:
         user_text = caption_text or "Пользователь отправил фото лица для консультации."
         verdict = self._guardrails.validate_user_text(user_text)
         if not verdict.allowed:
-            return verdict.message or "Я консультирую по уходу за кожей лица."
+            return verdict.message or tr("domain_redirect", session.language)
 
         self._mark_consultation_started(user_id, session, channel)
 
         session = self._memory.remember_user_message(user_id, f"[Фото] {user_text}")
+        session.consultation_turns += 1
         session.add_progress_photo(image_bytes=image_bytes, mime_type=image_mime_type, caption=caption_text or None)
         self._capture_profile_signals(user_id, session, user_text, channel)
 
         response_mode = self._resolve_response_mode(session, user_text)
-        tuning = self._build_response_tuning(
-            session=session,
-            user_text=user_text,
-            source_user_text=user_text,
-            mode=response_mode,
-            has_photo=True,
+        intent = IntentResult(
+            intent_type="question",
+            confidence=0.5,
+            emotional_tone="neutral",
+            complexity="simple",
         )
+        plan = Plan(
+            response_mode="educational",
+            reaction_type="neutral",
+            depth_level="short",
+            need_clarification=False,
+            risk_level="low",
+        )
+        tuning = self._default_response_tuning(intent=intent, plan=plan)
+        # TEMP: по запросу пользователя pre-pipeline отключен.
+        # intent = self._build_light_intent(user_text, session)
+        # session.last_intent = intent.intent_type
+        # plan = self._build_light_plan(
+        #     intent=intent,
+        #     session=session,
+        #     user_text=user_text,
+        #     has_photo=True,
+        # )
+        # adaptive_profile = self._adaptive_response_engine.choose(user_text, session, intent)
+        # tuning = self._build_response_tuning(
+        #     session=session,
+        #     user_text=user_text,
+        #     source_user_text=user_text,
+        #     mode=response_mode,
+        #     has_photo=True,
+        #     intent=intent,
+        #     plan=plan,
+        #     adaptive_profile=adaptive_profile,
+        # )
+        if self._log_reasoning:
+            self._log_reasoning_snapshot("photo", user_id, intent, plan, tuning, channel=channel)
 
         if self._is_progress_request(user_text) and len(session.progress_photos) >= 2:
             previous = session.progress_photos[-2]
@@ -643,7 +866,7 @@ class ConsultationService:
                     exc,
                     extra=log_extra(channel=channel, user_id=user_id, started_at=started_at),
                 )
-                safe_comparison = self._technical_pause_fallback()
+                safe_comparison = self._technical_pause_fallback(session)
 
             final_progress_reply = self._finalize_reply(
                 response_mode,
@@ -656,6 +879,8 @@ class ConsultationService:
                 low_confidence=tuning.low_confidence,
                 simple_question=tuning.simple_question,
                 routine_request=tuning.routine_request,
+                intent=tuning.intent,
+                plan=tuning.plan,
             )
             self._memory.remember_assistant_message(user_id, final_progress_reply)
             self._store_recommendation(user_id, session, response_mode, final_progress_reply)
@@ -664,11 +889,20 @@ class ConsultationService:
         history = self._token_guard.trim_history(self._memory.get_context_history(user_id), session)
         payload = [{"role": turn.role, "content": turn.content} for turn in history]
 
+        runtime_guidance = ""
+        # TEMP: по запросу пользователя pre-pipeline отключен.
+        # runtime_guidance = self._compose_runtime_guidance(
+        #     runtime_guidance=tuning.runtime_guidance,
+        #     intent=tuning.intent,
+        #     plan=tuning.plan,
+        #     thoughts=None,
+        # )
+
         prompt = build_system_prompt(
             response_mode,
             session,
             self._knowledge,
-            runtime_guidance=tuning.runtime_guidance,
+            runtime_guidance=runtime_guidance,
         )
 
         max_tokens, verbosity = self._response_profile(
@@ -677,6 +911,7 @@ class ConsultationService:
             safety,
             short_mode=tuning.short_mode,
             beginner_mode=tuning.beginner_mode,
+            depth_level=tuning.depth_level,
         )
 
         try:
@@ -696,7 +931,7 @@ class ConsultationService:
                 exc,
                 extra=log_extra(channel=channel, user_id=user_id, started_at=started_at),
             )
-            safe_reply = self._technical_pause_fallback()
+            safe_reply = self._technical_pause_fallback(session)
 
         final_reply = self._finalize_reply(
             response_mode,
@@ -709,6 +944,8 @@ class ConsultationService:
             low_confidence=tuning.low_confidence,
             simple_question=tuning.simple_question,
             routine_request=tuning.routine_request,
+            intent=tuning.intent,
+            plan=tuning.plan,
         )
         final_reply = self._apply_conversion(user_id, session, user_text, final_reply, channel)
         self._memory.remember_assistant_message(user_id, final_reply)
@@ -783,20 +1020,34 @@ class ConsultationService:
 
         return selected_mode
 
-    def _handle_menu_selection(self, user_id: str, text: str) -> str | None:
+    def _handle_menu_selection(self, session: UserSession, user_id: str, text: str) -> str | None:
         lowered = " ".join(text.lower().split())
+        lang = normalize_language(session.language)
+        consultation_label, skin_type_label, problem_label = menu_buttons(lang)
+        consultation_variants = {
+            " ".join(consultation_label.lower().split()),
+            " ".join(consultation_label.lower().replace("🔘", "").split()),
+        }
+        skin_type_variants = {
+            " ".join(skin_type_label.lower().split()),
+            " ".join(skin_type_label.lower().replace("🔘", "").split()),
+        }
+        problem_variants = {
+            " ".join(problem_label.lower().split()),
+            " ".join(problem_label.lower().replace("🔘", "").split()),
+        }
 
-        if lowered in self._MENU_CONSULTATION_LABELS:
+        if lowered in consultation_variants:
             self.set_mode(user_id, ChatMode.CONSULTATION)
-            return "Отлично, начнём консультацию. Опишите, что хотите улучшить в уходе."
+            return tr("menu_reply_consultation", lang)
 
-        if lowered in self._MENU_SKIN_TYPE_LABELS:
+        if lowered in skin_type_variants:
             self.set_mode(user_id, ChatMode.SKIN_TYPE)
-            return "Хорошо, помогу определить тип кожи. Можете описать ощущения кожи или отправить фото без фильтров."
+            return tr("menu_reply_skin_type", lang)
 
-        if lowered in self._MENU_PROBLEM_LABELS:
+        if lowered in problem_variants:
             self.set_mode(user_id, ChatMode.PROBLEM_SOLVING)
-            return "Давайте разберём проблему. Опишите, что беспокоит и как давно это проявляется."
+            return tr("menu_reply_problem", lang)
 
         return None
 
@@ -808,7 +1059,8 @@ class ConsultationService:
             (turn.content.lower() for turn in reversed(session.history) if turn.role == "assistant"),
             "",
         )
-        return any(marker in last_assistant for marker in self._FOLLOW_UP_PROMPT_MARKERS)
+        known_closings = all_soft_closings()
+        return any(marker.lower() in last_assistant for marker in known_closings)
 
     def _finalize_reply(
         self,
@@ -823,55 +1075,97 @@ class ConsultationService:
         low_confidence: bool = False,
         simple_question: bool = False,
         routine_request: bool = False,
+        intent: IntentResult | None = None,
+        plan: Plan | None = None,
     ) -> str:
-        body = self._postprocess_content(source_text)
-        body = self.simplify_language(body)
-        if not has_photo and not session.progress_photos:
-            body = self._strip_visual_claims_without_photo(body)
-            body = self._enforce_non_assumptive_symptom_language(body, user_text, session)
-            body = self._enforce_uncertainty_without_photo(body)
-        body = self._remove_age_based_skin_claims(body)
-        body = self._ensure_reaction(body, user_text, session, has_photo=has_photo)
-        body = self._deescalate_when_user_doubts(body, user_text, has_photo=has_photo)
-        body = self._remove_duplicate_reaction_lines(body)
-        body = self._ensure_practical_action(body)
-        # TEMP: не урезаем содержимое ответа для простых вопросов.
-        # if simple_question and not routine_request:
-        #     body = self._trim_unrequested_routine_sections(body, user_text)
-        body = self._ensure_soft_closing(
-            body,
-            session,
-            mode,
-            user_text=user_text,
-            short_mode=short_mode,
-            low_confidence=low_confidence,
+        _ = (
+            user_text,
+            has_photo,
+            short_mode,
+            beginner_mode,
+            low_confidence,
+            simple_question,
+            routine_request,
+            intent,
+            plan,
         )
-        if self._asks_human_contact(user_text):
-            body = self._append_human_contact_hint(body)
-        if low_confidence:
-            body = self._ensure_uncertainty_question(body)
-        personalized = self._apply_personalization(body, session, user_text)
-        personalized = self._strip_disallowed_gpt_style(personalized)
-        # TEMP: отключены все пост-лимиты длины, чтобы не обрезать ответы.
-        # personalized = self._enforce_telegram_compact_limits(personalized)
-        # if short_mode:
-        #     personalized = self._enforce_short_answer_mode(personalized)
-        # if beginner_mode:
-        #     personalized = self._enforce_beginner_compactness(personalized)
-        personalized = self._sanitize_text_flow(personalized)
-        personalized = self.humanizer_pipeline(personalized)
-        personalized = self._ensure_key_highlights(personalized)
-        personalized = self._enforce_bold_fragment_budget(personalized, max_fragments=3)
-        personalized = self._ensure_message_emojis(personalized)
-        personalized = self._enforce_emoji_budget(personalized, max_emojis=2)
-        return clean_response(personalized, fallback=self._fallback_for_mode(mode))
+        body = self._postprocess_content(source_text)
+
+        # TEMP: по запросу пользователя весь post-processing pipeline отключен.
+        # body = self.simplify_language(body, session.language)
+        # if not has_photo and not session.progress_photos:
+        #     body = self._strip_visual_claims_without_photo(body)
+        #     body = self._enforce_non_assumptive_symptom_language(body, user_text, session)
+        #     body = self._enforce_uncertainty_without_photo(body)
+        # body = self._remove_age_based_skin_claims(body)
+        # body = self._ensure_reaction(
+        #     body,
+        #     user_text,
+        #     session,
+        #     has_photo=has_photo,
+        #     intent=intent,
+        #     plan=plan,
+        # )
+        # body = self._deescalate_when_user_doubts(
+        #     body,
+        #     user_text,
+        #     has_photo=has_photo,
+        #     language=session.language,
+        # )
+        # body = self._remove_duplicate_reaction_lines(body)
+        # body = self._ensure_practical_action(body, session)
+        # body = self._ensure_soft_closing(
+        #     body,
+        #     session,
+        #     mode,
+        #     user_text=user_text,
+        #     short_mode=short_mode,
+        #     low_confidence=low_confidence,
+        #     intent=intent,
+        #     plan=plan,
+        # )
+        # if self._asks_human_contact(user_text):
+        #     body = self._append_human_contact_hint(body, session.language)
+        # if low_confidence:
+        #     body = self._ensure_uncertainty_question(body, session)
+        # personalized = self._apply_personalization(body, session, user_text)
+        # personalized = self._strip_disallowed_gpt_style(personalized)
+        # personalized = self._sanitize_text_flow(personalized)
+        # personalized = self.humanizer_pipeline(personalized, session.language)
+        # personalized = self._semantic_auto_format(
+        #     personalized,
+        #     user_text=user_text,
+        #     intent=intent,
+        # )
+        # personalized = self._semantic_emphasis_engine(personalized, max_fragments=6)
+        # personalized = self._emoji_decision_layer(
+        #     personalized,
+        #     session.language,
+        #     user_text=user_text,
+        #     intent=intent,
+        # )
+        # personalized = self.final_text_sanitizer(personalized)
+        # personalized = self._premium_quality_filter(personalized, session.language)
+        # personalized = self.final_text_sanitizer(personalized)
+
+        body = self.add_smart_emojis(body, max_emojis=self._MAX_SMART_EMOJIS)
+        return clean_response(body, fallback=self._fallback_for_mode(mode, session))
 
     def _postprocess_content(self, text: str) -> str:
         normalized = text
         normalized = re.sub(r"\bбренд\b", "категорию средства", normalized, flags=re.IGNORECASE)
         return normalized.strip()
 
-    def _ensure_reaction(self, text: str, user_text: str, session: UserSession, *, has_photo: bool) -> str:
+    def _ensure_reaction(
+        self,
+        text: str,
+        user_text: str,
+        session: UserSession,
+        *,
+        has_photo: bool,
+        intent: IntentResult | None,
+        plan: Plan | None,
+    ) -> str:
         if not text.strip():
             return text
 
@@ -880,38 +1174,54 @@ class ConsultationService:
         if any(lowered_first.startswith(marker) for marker in self._REACTION_STARTERS):
             return text
 
-        intent = self._detect_user_intent(user_text)
+        fallback_intent_type = self._detect_user_intent(user_text)
+        if fallback_intent_type not in {"question", "complaint", "emotion", "follow_up", "purchase", "off_topic"}:
+            fallback_intent_type = "question"
+        resolved_intent = intent or IntentResult(
+            intent_type=fallback_intent_type,  # type: ignore[arg-type]
+            confidence=0.55,
+            emotional_tone="neutral",
+            complexity="simple",
+        )
+        if resolved_intent.intent_type in {"follow_up", "question"}:
+            return text.strip()
+        if self._is_follow_up_short_reply(user_text):
+            return text.strip()
 
-        if self._is_doubt_or_objection(user_text):
-            reaction = "Вы правы, без фото сложно оценить точно."
-        elif has_photo:
-            reaction = "Спасибо за фото, это помогает точнее оценить ситуацию."
-        elif intent == "question":
-            reaction = "Очень хороший вопрос."
-        elif intent == "complaint":
-            reaction = "Понимаю, это может быть неприятно."
-        elif intent == "follow_up":
-            reaction = "Отлично, продолжаем."
-        elif any(marker in user_text.lower() for marker in self._PROBLEM_MARKERS):
-            reaction = "Такое бывает довольно часто, Вы не одни с этим сталкиваетесь."
+        lang = normalize_language(session.language)
+        if has_photo:
+            reaction = {
+                "ru": "Спасибо за фото, это помогает точнее оценить ситуацию.",
+                "en": "Thanks for the photo, this helps me assess the situation more accurately.",
+                "kg": "Сүрөт үчүн рахмат, бул абалды такыраак баалоого жардам берет.",
+            }[lang]
+        elif resolved_intent.intent_type == "emotion":
+            reaction = {
+                "ru": "Понимаю Ваши переживания.",
+                "en": "I understand your concerns.",
+                "kg": "Тынчсызданууңузду түшүнөм.",
+            }[lang]
+        elif resolved_intent.intent_type == "complaint":
+            reaction = {
+                "ru": "Понимаю, такое бывает довольно часто.",
+                "en": "I understand, this is quite common.",
+                "kg": "Түшүндүм, мындай абал көп кездешет.",
+            }[lang]
         else:
-            reaction = "Понимаю Ваш запрос."
+            reaction = ""
 
-        previous_opening = self._last_assistant_opening(session)
-        if previous_opening and previous_opening == reaction.lower():
-            reaction = "Поняла Вас, давайте разберем спокойно и по шагам."
-
+        if not reaction:
+            return text.strip()
+        if self._last_assistant_opening(session) == reaction.lower():
+            return text.strip()
         return f"{reaction}\n\n{text.strip()}"
 
-    def _ensure_practical_action(self, text: str) -> str:
+    def _ensure_practical_action(self, text: str, session: UserSession) -> str:
         lowered = text.lower()
         if any(marker in lowered for marker in self._PRACTICAL_MARKERS):
             return text
 
-        practical_line = (
-            "Практически: начните с одного действия — добавьте ежедневный SPF, "
-            "а новые активы вводите постепенно через патч-тест."
-        )
+        practical_line = tr("practical_step", session.language)
         return f"{text.strip()}\n\n{practical_line}"
 
     def _ensure_soft_closing(
@@ -923,6 +1233,8 @@ class ConsultationService:
         user_text: str,
         short_mode: bool,
         low_confidence: bool,
+        intent: IntentResult | None,
+        plan: Plan | None,
     ) -> str:
         normalized = re.sub(
             r"(?i)\s+(если хотите|если нужно|если удобно|могу также|могу|подключу менеджера|передам диалог|при желании)\b",
@@ -930,15 +1242,17 @@ class ConsultationService:
             text,
         )
         lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+        localized_closings = soft_closings(session.language)
+        all_known_closings = all_soft_closings()
         if not lines:
-            return self._SOFT_CLOSINGS[0]
+            return localized_closings[0]
 
         content_lines: list[str] = []
         selected_closing: str | None = None
 
         for line in lines:
             matched_closing = next(
-                (closing for closing in self._SOFT_CLOSINGS if line.lower() == closing.lower()),
+                (closing for closing in all_known_closings if line.lower() == closing.lower()),
                 None,
             )
             if matched_closing is not None:
@@ -946,7 +1260,7 @@ class ConsultationService:
                     selected_closing = matched_closing
                 continue
 
-            if self._is_cta_line(line):
+            if self._is_cta_line(line, session.language):
                 if selected_closing is None and session.purchase_stage == "hot_lead":
                     selected_closing = line
                 continue
@@ -960,6 +1274,8 @@ class ConsultationService:
                 user_text=user_text,
                 short_mode=short_mode,
                 low_confidence=low_confidence,
+                intent=intent,
+                plan=plan,
             )
 
         content = "\n\n".join(content_lines).strip()
@@ -977,24 +1293,35 @@ class ConsultationService:
         user_text: str,
         short_mode: bool,
         low_confidence: bool,
+        intent: IntentResult | None = None,
+        plan: Plan | None = None,
     ) -> str | None:
+        localized_closings = soft_closings(session.language)
         if session.purchase_stage == "hot_lead":
-            return self._CONVERSION_CLOSINGS[0]
+            return localized_closings[1]
         if low_confidence:
-            return "Если хотите, уточните 1–2 детали, и я подстрою рекомендацию точнее."
+            return tr("uncertainty_question", session.language)
+        if intent is not None and intent.intent_type == "follow_up":
+            return None
         if self._is_follow_up_short_reply(user_text):
-            return "Продолжим с этого шага или лучше коротко сравнить варианты?"
+            return None
+        if intent is not None and intent.intent_type == "emotion":
+            return localized_closings[3]
+        if intent is not None and intent.intent_type == "purchase":
+            return localized_closings[1]
 
         turn_index = max(session.total_messages_received, 1)
         if short_mode and turn_index % 3 == 0:
             return None
         if turn_index % 4 == 0:
             return None
+        if plan is not None and plan.depth_level == "deep":
+            return localized_closings[0]
         if mode in {ChatMode.INGREDIENT_CHECK, ChatMode.SKIN_TYPE}:
-            return self._EDUCATIONAL_CLOSINGS[0]
+            return localized_closings[2]
         if turn_index % 2 == 0:
-            return self._SUPPORT_CLOSINGS[0]
-        return self._EDUCATIONAL_CLOSINGS[1]
+            return localized_closings[3]
+        return localized_closings[2]
 
     def _apply_personalization(self, text: str, session: UserSession, user_text: str) -> str:
         if not session.onboarding_completed or not session.name:
@@ -1040,19 +1367,34 @@ class ConsultationService:
         response_text: str,
         channel: str,
     ) -> str:
-        if not self._has_explicit_purchase_intent(user_text):
-            return response_text
-
         user_message_count = self._memory.count_user_messages(user_id)
+        explicit_purchase = self._has_explicit_purchase_intent(user_text)
         has_intent = self._conversion_engine.detect_purchase_intent(
             user_text,
             user_message_count=user_message_count,
         )
-        if not has_intent:
+        trigger_after_messages = session.consultation_turns > 5
+
+        if session.awaiting_manager_confirmation:
             return response_text
+
+        if not explicit_purchase and not has_intent:
+            if not trigger_after_messages or session.soft_offer_sent:
+                return response_text
+            offer_question = tr("conversion_offer_question", session.language).strip()
+            if not offer_question:
+                return response_text
+            session.soft_offer_sent = True
+            session.awaiting_manager_confirmation = True
+            core = self._strip_soft_closing_tail(response_text)
+            if not core:
+                return offer_question
+            return f"{core}\n\n{offer_question}"
 
         if not self._conversion_engine.is_hot_lead(session):
             session.purchase_stage = "hot_lead"
+            session.soft_offer_sent = True
+            session.awaiting_manager_confirmation = False
             try:
                 self._crm.mark_hot_lead(user_id)
             except Exception as exc:
@@ -1068,8 +1410,8 @@ class ConsultationService:
                 },
             )
 
-        soft_offer = self._conversion_engine.build_soft_offer().strip()
-        human_handoff = self._conversion_engine.escalate_to_human().strip()
+        soft_offer = self._conversion_engine.build_soft_offer(session.language).strip()
+        human_handoff = self._conversion_engine.escalate_to_human(session.language).strip()
         offer_block = " ".join(part for part in (soft_offer, human_handoff) if part).strip()
         if not offer_block:
             return response_text
@@ -1079,6 +1421,32 @@ class ConsultationService:
             return offer_block
         return f"{core}\n\n{offer_block}"
 
+    def _handle_pending_manager_confirmation(self, session: UserSession, user_text: str) -> str | None:
+        if not session.awaiting_manager_confirmation:
+            return None
+        if self._is_affirmative_reply(user_text) or self._has_explicit_purchase_intent(user_text):
+            session.awaiting_manager_confirmation = False
+            session.purchase_stage = "hot_lead"
+            return self._conversion_engine.escalate_to_human(session.language).strip()
+        if self._is_negative_reply(user_text):
+            session.awaiting_manager_confirmation = False
+            return tr("conversion_declined", session.language)
+        return None
+
+    @classmethod
+    def _is_affirmative_reply(cls, text: str) -> bool:
+        normalized = " ".join(text.lower().split()).strip(" .,!?:;")
+        if not normalized or len(normalized.split()) > 4:
+            return False
+        return normalized in cls._AFFIRMATIVE_MARKERS
+
+    @classmethod
+    def _is_negative_reply(cls, text: str) -> bool:
+        normalized = " ".join(text.lower().split()).strip(" .,!?:;")
+        if not normalized or len(normalized.split()) > 4:
+            return False
+        return normalized in cls._NEGATIVE_MARKERS
+
     def _response_profile(
         self,
         mode: ChatMode,
@@ -1087,16 +1455,17 @@ class ConsultationService:
         *,
         short_mode: bool = False,
         beginner_mode: bool = False,
+        depth_level: str = "short",
     ) -> tuple[int, str]:
         complexity = self._complexity_level(user_text)
         if complexity == "simple":
-            tokens = 900
+            tokens = 420
             verbosity = "low"
         elif complexity == "medium":
-            tokens = 1200
+            tokens = 700
             verbosity = "low"
         else:
-            tokens = 1600
+            tokens = 1100
             verbosity = "medium"
         # TEMP: режимы не должны дополнительно ужимать длину генерации.
         # if mode == ChatMode.INGREDIENT_CHECK:
@@ -1110,7 +1479,12 @@ class ConsultationService:
         #     tokens = min(tokens, 260)
 
         tokens = int(tokens * guard_decision.token_multiplier)
-        tokens = max(tokens, 700)
+        tokens = max(tokens, 300)
+        if depth_level == "deep":
+            tokens = max(tokens, 1100)
+            verbosity = "medium"
+        elif depth_level == "medium":
+            tokens = max(tokens, 700)
 
         if guard_decision.forced_verbosity:
             verbosity = guard_decision.forced_verbosity
@@ -1126,6 +1500,114 @@ class ConsultationService:
             return "medium"
         return "simple"
 
+    @staticmethod
+    def _default_response_tuning(*, intent: IntentResult, plan: Plan) -> ResponseTuning:
+        return ResponseTuning(
+            runtime_guidance="",
+            short_mode=False,
+            beginner_mode=False,
+            low_confidence=False,
+            simple_question=False,
+            routine_request=False,
+            depth_level=plan.depth_level,
+            intent=intent,
+            plan=plan,
+        )
+
+    def _build_light_intent(self, user_text: str, session: UserSession) -> IntentResult:
+        lowered = user_text.lower().strip()
+        if self._is_strict_domain_offtopic(user_text):
+            intent_type = "off_topic"
+            confidence = 0.88
+        elif self._has_explicit_purchase_intent(user_text):
+            intent_type = "purchase"
+            confidence = 0.84
+        elif self._is_follow_up_short_reply(user_text):
+            intent_type = "follow_up"
+            confidence = 0.8 if session.last_intent else 0.72
+        else:
+            detected = self._detect_user_intent(user_text)
+            if detected in {"question", "complaint", "emotion", "purchase", "follow_up", "off_topic"}:
+                intent_type = detected
+                confidence = 0.7
+            else:
+                intent_type = "question"
+                confidence = 0.55
+
+        emotional_tone = self._light_emotional_tone(lowered)
+        complexity = self._light_complexity(user_text)
+        return IntentResult(
+            intent_type=intent_type,  # type: ignore[arg-type]
+            confidence=confidence,
+            emotional_tone=emotional_tone, # pyright: ignore[reportArgumentType]
+            complexity=complexity, # pyright: ignore[reportArgumentType]
+        )
+
+    def _build_light_plan(
+        self,
+        *,
+        intent: IntentResult,
+        session: UserSession,
+        user_text: str,
+        has_photo: bool,
+    ) -> Plan:
+        if intent.intent_type == "follow_up":
+            response_mode = "short_answer"
+            depth_level = "short"
+            reaction_type = "neutral"
+        elif intent.intent_type == "complaint":
+            response_mode = "empathetic"
+            depth_level = "medium" if len(user_text) > 80 else "short"
+            reaction_type = "empathy"
+        elif intent.intent_type == "emotion":
+            response_mode = "empathetic"
+            depth_level = "short"
+            reaction_type = "validation"
+        elif intent.intent_type == "purchase":
+            response_mode = "diagnostic"
+            depth_level = "medium"
+            reaction_type = "neutral"
+        else:
+            response_mode = "educational"
+            depth_level = "medium" if len(user_text) > 90 else "short"
+            reaction_type = "question_reaction"
+
+        need_clarification = (
+            (not has_photo)
+            and intent.intent_type in {"question", "purchase"}
+            and not self._has_symptom_description(user_text, session)
+        )
+        risk_level = (
+            "medium"
+            if (intent.intent_type in {"complaint", "emotion"} and not has_photo)
+            else "low"
+        )
+        return Plan(
+            response_mode=response_mode,  # type: ignore[arg-type]
+            reaction_type=reaction_type,  # type: ignore[arg-type]
+            depth_level=depth_level,  # type: ignore[arg-type]
+            need_clarification=need_clarification,
+            risk_level=risk_level,  # type: ignore[arg-type]
+        )
+
+    @staticmethod
+    def _light_emotional_tone(lowered_text: str) -> str:
+        if any(marker in lowered_text for marker in ("переж", "боюсь", "трев", "worried", "анxious", "корком")):
+            return "worried"
+        if any(marker in lowered_text for marker in ("не понимаю", "запутал", "неясно", "confused", "түшүнбөдүм")):
+            return "confused"
+        if any(marker in lowered_text for marker in ("надоело", "бесит", "не помогает", "устал", "frustrat")):
+            return "frustrated"
+        return "neutral"
+
+    def _light_complexity(self, user_text: str) -> str:
+        level = self._complexity_level(user_text)
+        if level == "complex":
+            return "deep"
+        if level == "medium":
+            return "medium"
+        return "simple"
+
     def _build_response_tuning(
         self,
         *,
@@ -1134,22 +1616,37 @@ class ConsultationService:
         source_user_text: str,
         mode: ChatMode,
         has_photo: bool,
+        intent: IntentResult,
+        plan: Plan,
+        adaptive_profile: Any,
     ) -> ResponseTuning:
         signals = self._context_intelligence.analyze(user_text, mode)
         lines = [self._context_intelligence.build_runtime_guidance(signals, mode)]
 
         beginner_mode = self._is_beginner_mode(user_text, session)
         simple_question = self._is_simple_question(user_text)
-        short_mode = self._is_short_answer_mode(user_text, session)
+        short_mode = bool(getattr(adaptive_profile, "short_mode", False))
+        depth_level = str(getattr(adaptive_profile, "depth_level", plan.depth_level))
+        suppress_lecture = bool(getattr(adaptive_profile, "suppress_lecture", False))
         routine_request = self._is_routine_builder_request(user_text)
-        user_intent = self._detect_user_intent(source_user_text)
         low_confidence = self._is_low_confidence_answer(
             user_text=user_text,
             session=session,
             has_photo=has_photo,
         )
+        if plan.need_clarification:
+            low_confidence = True
 
-        lines.append(f"Intent: {user_intent}.")
+        lines.append(
+            "Reasoning intent: "
+            f"type={intent.intent_type}; tone={intent.emotional_tone}; "
+            f"confidence={intent.confidence:.2f}; complexity={intent.complexity}."
+        )
+        lines.append(
+            "Planner: "
+            f"mode={plan.response_mode}; reaction={plan.reaction_type}; depth={plan.depth_level}; "
+            f"risk={plan.risk_level}; clarify={str(plan.need_clarification).lower()}."
+        )
 
         if self._is_doubt_or_objection(user_text):
             lines.append(
@@ -1163,6 +1660,8 @@ class ConsultationService:
 
         if self._is_follow_up_short_reply(source_user_text):
             lines.append("Это follow-up: ответ коротко, по делу, без лекции.")
+        if suppress_lecture:
+            lines.append("Не превращайте ответ в статью; давайте только нужный минимум по делу.")
 
         if not has_photo:
             lines.append(
@@ -1180,6 +1679,11 @@ class ConsultationService:
         if short_mode:
             lines.append("Short mode: 4-6 строк, одна мысль на абзац.")
 
+        if depth_level == "deep":
+            lines.append("Deep mode: дайте более подробный разбор, но без перегруза и воды.")
+        elif depth_level == "medium":
+            lines.append("Medium depth: объясните чуть глубже, чем базовый чат-ответ.")
+
         if routine_request:
             lines.append("Соберите уход в 1 экран: Утро / Вечер / Раз в неделю. Коротко и по сути.")
         else:
@@ -1194,8 +1698,11 @@ class ConsultationService:
         lines.append("Ответ должен ощущаться как сообщение в мессенджере, не статья.")
         lines.append("Короткие абзацы для мобильного экрана.")
         lines.append("Лучше честность, чем уверенность без данных.")
+        lines.append(language_instruction(session.language))
 
-        if mode != ChatMode.INGREDIENT_CHECK and (beginner_mode or not short_mode or user_intent == "follow_up"):
+        if mode != ChatMode.INGREDIENT_CHECK and (
+            beginner_mode or not short_mode or intent.intent_type in {"follow_up", "emotion"}
+        ):
             lines.append("enable_soft_closing=True")
 
         if low_confidence:
@@ -1212,6 +1719,9 @@ class ConsultationService:
             low_confidence=low_confidence,
             simple_question=simple_question,
             routine_request=routine_request,
+            depth_level=depth_level,
+            intent=intent,
+            plan=plan,
         )
 
     @staticmethod
@@ -1239,6 +1749,220 @@ class ConsultationService:
             guidance = guidance[:max_chars].rstrip(" ,;:")
         return guidance
 
+    def _build_planner_context(
+        self,
+        *,
+        session: UserSession,
+        user_text: str,
+        has_photo: bool,
+        response_mode: ChatMode,
+    ) -> dict[str, Any]:
+        signals = self._context_intelligence.analyze(user_text, response_mode)
+        last_assistant = next(
+            (
+                turn.content.strip()
+                for turn in reversed(session.history)
+                if turn.role == "assistant" and turn.content.strip()
+            ),
+            "",
+        )
+        return {
+            "has_photo": has_photo,
+            "has_symptoms": self._has_symptom_description(user_text, session),
+            "simple_question": self._is_simple_question(user_text),
+            "sensitivity_risk": signals.sensitivity_risk,
+            "last_assistant_message": last_assistant[:260],
+            "emotional_trajectory": self._emotional_trajectory(session),
+            "skin_journal": session.skin_journal if isinstance(session.skin_journal, dict) else {},
+        }
+
+    def _emotional_trajectory(self, session: UserSession) -> str:
+        recent_user = [
+            turn.content.lower()
+            for turn in session.history
+            if turn.role == "user" and turn.content.strip()
+        ][-4:]
+        if not recent_user:
+            return "neutral"
+        worried_hits = sum(1 for msg in recent_user if any(m in msg for m in ("переж", "боюсь", "трев")))
+        frustrated_hits = sum(1 for msg in recent_user if any(m in msg for m in ("не помог", "хуже", "надоело")))
+        if frustrated_hits >= 2:
+            return "frustrated"
+        if worried_hits >= 2:
+            return "worried"
+        return "neutral"
+
+    async def _generate_internal_thoughts(
+        self,
+        *,
+        user_text: str,
+        payload: list[dict[str, str]],
+        intent: IntentResult,
+        plan: Plan,
+        has_photo: bool,
+    ) -> dict[str, Any]:
+        thought_payload = {
+            "user_text": user_text,
+            "has_photo": has_photo,
+            "intent": {
+                "type": intent.intent_type,
+                "confidence": round(intent.confidence, 2),
+                "tone": intent.emotional_tone,
+                "complexity": intent.complexity,
+            },
+            "plan": {
+                "response_mode": plan.response_mode,
+                "reaction_type": plan.reaction_type,
+                "depth_level": plan.depth_level,
+                "need_clarification": plan.need_clarification,
+                "risk_level": plan.risk_level,
+            },
+            "history_tail": payload[-4:],
+            "output_schema": {
+                "focus": "string",
+                "must_include": ["string"],
+                "must_avoid": ["string"],
+                "clarifying_question": "string|null",
+            },
+        }
+        default_thoughts = {
+            "focus": "Дать практичный и честный ответ по skincare-контексту.",
+            "must_include": ["Практический следующий шаг"],
+            "must_avoid": ["Категоричные выводы без данных"],
+            "clarifying_question": "Уточните 1–2 детали, чтобы я подстроила уход точнее."
+            if plan.need_clarification
+            else "",
+        }
+        try:
+            raw = await self._openai_client.generate_reply(
+                system_prompt=(
+                    "Ты внутренний планировщик ответа косметолога. Думай, но не пиши пользователю. "
+                    "Верни только JSON."
+                ),
+                dialogue=[
+                    {
+                        "role": "user",
+                        "content": json.dumps(thought_payload, ensure_ascii=False),
+                    }
+                ],
+                max_output_tokens=220,
+                verbosity="low",
+                allow_small_output=True,
+            )
+        except Exception:
+            return default_thoughts
+
+        parsed = self._extract_json_dict(raw)
+        if not parsed:
+            return default_thoughts
+
+        focus = str(parsed.get("focus", "")).strip() or default_thoughts["focus"]
+        must_include_raw = parsed.get("must_include", [])
+        must_avoid_raw = parsed.get("must_avoid", [])
+        must_include = must_include_raw if isinstance(must_include_raw, list) else []
+        must_avoid = must_avoid_raw if isinstance(must_avoid_raw, list) else []
+        clarifying_question = str(parsed.get("clarifying_question", "")).strip()
+        if plan.need_clarification and not clarifying_question:
+            clarifying_question = str(default_thoughts["clarifying_question"])
+
+        return {
+            "focus": focus[:180],
+            "must_include": [str(item)[:120] for item in must_include[:3] if str(item).strip()],
+            "must_avoid": [str(item)[:120] for item in must_avoid[:3] if str(item).strip()],
+            "clarifying_question": clarifying_question[:180],
+        }
+
+    def _compose_runtime_guidance(
+        self,
+        *,
+        runtime_guidance: str,
+        intent: IntentResult,
+        plan: Plan,
+        thoughts: dict[str, Any] | None,
+    ) -> str:
+        lines: list[str] = []
+        if runtime_guidance.strip():
+            lines.extend(runtime_guidance.splitlines())
+
+        lines.append(
+            "Reasoning summary: "
+            f"intent={intent.intent_type}; tone={intent.emotional_tone}; "
+            f"plan={plan.response_mode}/{plan.depth_level}; reaction={plan.reaction_type}."
+        )
+
+        if thoughts:
+            focus = str(thoughts.get("focus", "")).strip()
+            if focus:
+                lines.append(f"Internal focus: {focus}")
+            must_include = thoughts.get("must_include", [])
+            if isinstance(must_include, list) and must_include:
+                lines.append(f"Must include: {', '.join(str(item) for item in must_include[:2])}.")
+            must_avoid = thoughts.get("must_avoid", [])
+            if isinstance(must_avoid, list) and must_avoid:
+                lines.append(f"Must avoid: {', '.join(str(item) for item in must_avoid[:2])}.")
+            clarifying = str(thoughts.get("clarifying_question", "")).strip()
+            if clarifying:
+                lines.append(f"Clarifying hint: {clarifying}")
+
+        return self._compact_runtime_guidance(lines, max_lines=14, max_chars=1200)
+
+    def _log_reasoning_snapshot(
+        self,
+        source: str,
+        user_id: str,
+        intent: IntentResult,
+        plan: Plan,
+        tuning: ResponseTuning,
+        *,
+        channel: str,
+    ) -> None:
+        if not self._log_reasoning:
+            return
+        logger.info(
+            "reasoning[%s] intent=%s(%.2f/%s/%s) plan=%s/%s/%s clarify=%s risk=%s short=%s low_conf=%s",
+            source,
+            intent.intent_type,
+            intent.confidence,
+            intent.emotional_tone,
+            intent.complexity,
+            plan.response_mode,
+            plan.reaction_type,
+            plan.depth_level,
+            plan.need_clarification,
+            plan.risk_level,
+            tuning.short_mode,
+            tuning.low_confidence,
+            extra=log_extra(channel=channel, user_id=user_id),
+        )
+
+    @staticmethod
+    def _extract_json_dict(raw_text: str) -> dict[str, Any]:
+        if not raw_text:
+            return {}
+        candidate = raw_text.strip()
+        match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
+        if match:
+            candidate = match.group(0)
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _env_flag(name: str, *, default: bool) -> bool:
+        raw = os.getenv(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _normalize_reasoning_mode(value: str) -> str:
+        mode = str(value or "").strip().lower()
+        if mode in {"smart", "turbo"}:
+            return mode
+        return "smart"
+
     def _store_recommendation(self, user_id: str, session: UserSession, mode: ChatMode, reply: str) -> None:
         lines = [line.strip("•- ") for line in reply.splitlines() if line.strip()]
         session.last_recommendations = lines[-3:]
@@ -1253,7 +1977,7 @@ class ConsultationService:
 
     def _save_crm_event(self, user_id: str, event_type: str, payload: dict[str, Any]) -> None:
         try:
-            self._crm.save_event(user_id, event_type, payload)
+            self._crm.save_event(user_id, event_type, payload) # pyright: ignore[reportArgumentType]
         except NotImplementedError:
             return
         except Exception as exc:
@@ -1291,11 +2015,12 @@ class ConsultationService:
             return "нормальная"
         return None
 
-    def simplify_language(self, text: str) -> str:
+    def simplify_language(self, text: str, language: str | None = None) -> str:
         simplified = text.strip()
         if not simplified:
             return simplified
 
+        lang = normalize_language(language)
         technical_detected = self._has_technical_info(simplified)
         formal_detected = self._is_formal_tone(simplified)
         simplified = self._replace_complex_terms(simplified)
@@ -1304,11 +2029,10 @@ class ConsultationService:
         # simplified = self._limit_active_mentions(simplified, max_active=3)
         simplified = self._split_long_sentences(simplified, max_words=18)
         if technical_detected:
-            simplified = self._inject_human_translator_line(simplified)
-        simplified = self._inject_warmth_if_formal(simplified, force=formal_detected)
+            simplified = self._inject_human_translator_line(simplified, lang)
+        simplified = self._inject_warmth_if_formal(simplified, lang, force=formal_detected)
         # TEMP: не ограничиваем число абзацев, чтобы не терять хвост ответа.
         # simplified = self._enforce_conversational_rhythm(simplified, max_paragraphs=8)
-        simplified = self._bold_ingredients(simplified)
         simplified = re.sub(r"\n{3,}", "\n\n", simplified)
         return simplified.strip()
 
@@ -1413,15 +2137,25 @@ class ConsultationService:
         return any(source in lowered for source, _ in cls._MEDICAL_TO_SIMPLE)
 
     @staticmethod
-    def _inject_human_translator_line(text: str) -> str:
+    def _inject_human_translator_line(text: str, language: str | None) -> str:
         lowered = text.lower()
         if "проще говоря:" in lowered or "если совсем просто:" in lowered:
             return text
+        if "simply put:" in lowered or "in simple words:" in lowered:
+            return text
 
-        if any(marker in lowered for marker in ("сух", "потеря влаги", "обезвож")):
-            translator = "Проще говоря: коже не хватает увлажнения."
+        lang = normalize_language(language)
+        if lang == "en":
+            dry_markers = ("dry", "dehydrat", "moisture")
+        elif lang == "kg":
+            dry_markers = ("кургак", "ным", "суусуз")
         else:
-            translator = "Если совсем просто: коже нужен более мягкий и понятный уход."
+            dry_markers = ("сух", "потеря влаги", "обезвож")
+
+        if any(marker in lowered for marker in dry_markers):
+            translator = tr("translator_dry", lang)
+        else:
+            translator = tr("translator_generic", lang)
 
         paragraphs = [part.strip() for part in text.split("\n\n") if part.strip()]
         if not paragraphs:
@@ -1431,9 +2165,13 @@ class ConsultationService:
         return "\n\n".join(paragraphs).strip()
 
     @staticmethod
-    def _inject_warmth_if_formal(text: str, *, force: bool = False) -> str:
+    def _inject_warmth_if_formal(text: str, language: str | None, *, force: bool = False) -> str:
         lowered = text.lower()
         if "если говорить проще," in lowered or "если по-человечески," in lowered:
+            return text
+        if "to put it simply," in lowered:
+            return text
+        if "жөнөкөй айтсам," in lowered:
             return text
 
         formal_markers = ("рекомендуется", "необходимо", "следует", "целесообразно", "в рамках", "данный")
@@ -1443,7 +2181,7 @@ class ConsultationService:
         paragraphs = [part.strip() for part in text.split("\n\n") if part.strip()]
         if not paragraphs:
             return text
-        paragraphs.insert(0, "Если говорить проще,")
+        paragraphs.insert(0, tr("warmth_prefix", language))
         return "\n\n".join(paragraphs).strip()
 
     @staticmethod
@@ -1517,8 +2255,8 @@ class ConsultationService:
         lowered = user_text.lower()
         return any(marker in lowered for marker in self._HUMAN_CONTACT_MARKERS)
 
-    def _append_human_contact_hint(self, text: str) -> str:
-        hint = self._conversion_engine.escalate_to_human().strip()
+    def _append_human_contact_hint(self, text: str, language: str | None) -> str:
+        hint = self._conversion_engine.escalate_to_human(language).strip()
         if not hint:
             return text
         if hint.lower() in text.lower():
@@ -1532,23 +2270,43 @@ class ConsultationService:
         return any(marker in lowered for marker in self._OFFTOPIC_MARKERS)
 
     @staticmethod
-    def _soft_domain_redirect(user_text: str, fallback: str | None = None) -> str:
+    def _soft_domain_redirect(
+        user_text: str,
+        fallback: str | None = None,
+        *,
+        language: str | None = None,
+    ) -> str:
         _ = user_text
+        lang = normalize_language(language)
         if fallback:
-            return (
-                f"{fallback}\n\n"
-                "Если хотите, давайте вернемся к коже: могу помочь с типом кожи, "
-                "проблемой или составом средства 🤍"
+            return tr(
+                "domain_redirect_with_fallback",
+                lang,
+                fallback=fallback,
             )
-        return (
-            "Я сфокусирована на коже и уходе 🤍\n\n"
-            "Если хотите, давайте разберем Ваш запрос по типу кожи, проблеме или составу средства."
-        )
+        return tr("domain_redirect", lang)
 
     def _smooth_user_intent(self, user_text: str, session: UserSession) -> str:
         text = " ".join(user_text.split())
         if not self._is_follow_up_short_reply(text):
             return text
+
+        lang = normalize_language(session.language)
+        follow_up_suffix = {
+            "ru": "Уточнение пользователя",
+            "en": "User follow-up",
+            "kg": "Колдонуучунун тактоосу",
+        }[lang]
+        context_prefix = {
+            "ru": "Контекст диалога",
+            "en": "Conversation context",
+            "kg": "Диалог контексти",
+        }[lang]
+        intent_hint_prefix = {
+            "ru": "Предыдущий интент",
+            "en": "Previous intent",
+            "kg": "Мурунку ниет",
+        }[lang]
 
         recent_user = next(
             (
@@ -1559,7 +2317,9 @@ class ConsultationService:
             "",
         )
         if recent_user:
-            return f"{recent_user}. Уточнение пользователя: {text}"
+            if session.last_intent:
+                return f"{intent_hint_prefix}: {session.last_intent}. {recent_user}. {follow_up_suffix}: {text}"
+            return f"{recent_user}. {follow_up_suffix}: {text}"
 
         recent_assistant = next(
             (
@@ -1570,7 +2330,12 @@ class ConsultationService:
             "",
         )
         if recent_assistant:
-            return f"Контекст диалога: {recent_assistant[:160]}. Уточнение пользователя: {text}"
+            if session.last_intent:
+                return (
+                    f"{intent_hint_prefix}: {session.last_intent}. "
+                    f"{context_prefix}: {recent_assistant[:160]}. {follow_up_suffix}: {text}"
+                )
+            return f"{context_prefix}: {recent_assistant[:160]}. {follow_up_suffix}: {text}"
         return text
 
     def _is_follow_up_short_reply(self, user_text: str) -> bool:
@@ -1746,7 +2511,14 @@ class ConsultationService:
         sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
         return sanitized.strip()
 
-    def _deescalate_when_user_doubts(self, text: str, user_text: str, *, has_photo: bool) -> str:
+    def _deescalate_when_user_doubts(
+        self,
+        text: str,
+        user_text: str,
+        *,
+        has_photo: bool,
+        language: str | None,
+    ) -> str:
         if not self._is_doubt_or_objection(user_text):
             return text
 
@@ -1758,9 +2530,10 @@ class ConsultationService:
         if has_photo:
             return softened
 
-        if "без фото сложно оценить точно" in softened.lower():
+        localized_prefix = tr("doubt_prefix", language)
+        if localized_prefix.lower() in softened.lower():
             return softened
-        return f"Вы правы, без фото сложно оценить точно.\n\n{softened.strip()}"
+        return f"{localized_prefix}\n\n{softened.strip()}"
 
     @classmethod
     def _build_user_symptom_context(cls, user_text: str, session: UserSession) -> str:
@@ -1919,11 +2692,11 @@ class ConsultationService:
         return sanitized.strip()
 
     @staticmethod
-    def _ensure_uncertainty_question(text: str) -> str:
+    def _ensure_uncertainty_question(text: str, session: UserSession) -> str:
         lowered = text.lower()
         if "?" in text or "уточн" in lowered or "опишите" in lowered or "фото" in lowered:
             return text
-        follow_up = "Если хотите, уточните ощущения после умывания или отправьте фото при дневном свете."
+        follow_up = tr("uncertainty_question", session.language)
         return f"{text.strip()}\n\n{follow_up}"
 
     @staticmethod
@@ -1982,16 +2755,126 @@ class ConsultationService:
         trimmed = re.sub(r"[,:;]+$", ".", trimmed)
         return trimmed.strip()
 
-    def humanizer_pipeline(self, reply: str) -> str:
+    def humanizer_pipeline(self, reply: str, language: str | None = None) -> str:
         humanized = self._soften_bureaucratic_tone(reply)
         humanized = self._strip_ai_scaffold(humanized)
+        humanized = self._anti_robotic_rewrite_pass(humanized)
+        humanized = self._remove_template_patterns(humanized)
         humanized = self._repair_broken_word_chunks(humanized)
-        humanized = self._rewrite_contact_refusal(humanized)
+        humanized = self._rewrite_contact_refusal(humanized, language)
         humanized = self._remove_duplicate_reaction_lines(humanized)
+        humanized = self._merge_adjacent_short_sentences(humanized)
         humanized = self._merge_short_paragraphs(humanized)
         humanized = self._self_rewrite_if_needed(humanized)
         humanized = self._fix_ragged_ending(humanized)
         return humanized.strip()
+
+    @staticmethod
+    def _segment_long_reply_into_topics(text: str, language: str | None = None) -> str:
+        normalized = text.strip()
+        if len(normalized) < 420:
+            return normalized
+        if re.search(r"(?im)^\*[^\n]{2,48}\*$", normalized):
+            return normalized
+
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", normalized) if part.strip()]
+        if len(sentences) < 5:
+            return normalized
+
+        intro = sentences[0]
+        explain: list[str] = []
+        actions: list[str] = []
+        cautions: list[str] = []
+
+        action_markers = (
+            "начните",
+            "добав",
+            "использ",
+            "нанос",
+            "шаг",
+            "план",
+            "утром",
+            "вечером",
+            "spf",
+            "кислот",
+            "ниацинамид",
+            "бензоил",
+            "очищ",
+            "крем",
+        )
+        caution_markers = (
+            "избег",
+            "не выдавл",
+            "не трог",
+            "раздраж",
+            "жж",
+            "сухост",
+            "дерматолог",
+            "недель",
+            "если",
+        )
+
+        for sentence in sentences[1:]:
+            lowered = sentence.lower()
+            if any(marker in lowered for marker in action_markers):
+                actions.append(sentence)
+                continue
+            if any(marker in lowered for marker in caution_markers):
+                cautions.append(sentence)
+                continue
+            explain.append(sentence)
+
+        if not actions:
+            return normalized
+
+        blocks = [intro]
+        why_title = tr("topic_why", language)
+        now_title = tr("topic_now", language)
+        important_title = tr("topic_important", language)
+        if explain:
+            blocks.append(f"*{why_title}*\n" + " ".join(explain[:2]))
+        blocks.append(f"*{now_title}*\n" + " ".join(actions[:3]))
+        if cautions:
+            blocks.append(f"*{important_title}*\n" + " ".join(cautions[:2]))
+
+        return "\n\n".join(blocks).strip()
+
+    @staticmethod
+    def _anti_robotic_rewrite_pass(text: str) -> str:
+        rewritten = text
+        rewritten = re.sub(r"(?im)^\s*очень хороший вопрос\.\s*очень хороший вопрос\.\s*", "Очень хороший вопрос.\n\n", rewritten)
+        rewritten = re.sub(r"(?im)^\s*понимаю[, ]+понимаю[, ]+", "Понимаю, ", rewritten)
+        rewritten = re.sub(r"(?im)\bдавайте разберем подробнее подробно\b", "давайте разберем подробнее", rewritten)
+        rewritten = re.sub(r"\n{3,}", "\n\n", rewritten)
+        return rewritten.strip()
+
+    @staticmethod
+    def _remove_template_patterns(text: str) -> str:
+        cleaned = text
+        patterns = (
+            r"(?im)^\s*как ai[- ]?консультант[,:\s]*",
+            r"(?im)^\s*на основе описания[,:\s]*",
+            r"(?im)^\s*в данном случае[,:\s]*",
+            r"(?im)^\s*итак[,:\s]*",
+        )
+        for pattern in patterns:
+            cleaned = re.sub(pattern, "", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
+    def _merge_adjacent_short_sentences(text: str) -> str:
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", text.strip()) if part.strip()]
+        if not sentences:
+            return text.strip()
+
+        merged: list[str] = []
+        for sentence in sentences:
+            if merged and len(merged[-1].split()) <= 4 and len(sentence.split()) <= 6:
+                merged[-1] = f"{merged[-1]} {sentence}"
+            else:
+                merged.append(sentence)
+        return " ".join(merged).strip()
 
     def _soften_bureaucratic_tone(self, text: str) -> str:
         softened = text
@@ -2032,11 +2915,11 @@ class ConsultationService:
         repaired = re.sub(r"\n{3,}", "\n\n", repaired)
         return repaired
 
-    def _rewrite_contact_refusal(self, text: str) -> str:
+    def _rewrite_contact_refusal(self, text: str, language: str | None = None) -> str:
         normalized = text
         refusal_pattern = re.compile(r"(?i)я\s+не\s+даю\s+прямых\s+контактов[^.!?\n]*(?:[.!?]|$)")
         if refusal_pattern.search(normalized):
-            handoff = self._conversion_engine.escalate_to_human().strip()
+            handoff = self._conversion_engine.escalate_to_human(language).strip()
             normalized = refusal_pattern.sub(f"{handoff} ", normalized)
             normalized = re.sub(r"\s{2,}", " ", normalized)
         return normalized.strip()
@@ -2062,18 +2945,24 @@ class ConsultationService:
     @classmethod
     def _ensure_key_highlights(cls, text: str) -> str:
         highlighted = cls._count_bold_fragments(text)
-        if highlighted >= 3:
+        if highlighted >= 6:
             return text
 
         emphasized = text
         patterns = (
             re.compile(r"(?<!\*)\bspf\b(?!\*)", re.IGNORECASE),
+            re.compile(r"(?<!\*)\bspf\s*30\+\b(?!\*)", re.IGNORECASE),
             re.compile(r"(?<!\*)\bпатч-тест\b(?!\*)", re.IGNORECASE),
             re.compile(r"(?<!\*)\bувлажняющий крем\b(?!\*)", re.IGNORECASE),
             re.compile(r"(?<!\*)\bмягкое очищение\b(?!\*)", re.IGNORECASE),
+            re.compile(r"(?<!\*)\bсалицилов(?:ая|ой)\s+кислот[аы]\b(?!\*)", re.IGNORECASE),
+            re.compile(r"(?<!\*)\bниацинамид\b(?!\*)", re.IGNORECASE),
+            re.compile(r"(?<!\*)\bбензоилпероксид\b(?!\*)", re.IGNORECASE),
+            re.compile(r"(?<!\*)\bакне\b(?!\*)", re.IGNORECASE),
+            re.compile(r"(?<!\*)\bвысыпан(?:ия|ий)\b(?!\*)", re.IGNORECASE),
         )
         for pattern in patterns:
-            if highlighted >= 3:
+            if highlighted >= 6:
                 break
             if pattern.search(emphasized):
                 emphasized = pattern.sub(lambda m: f"*{m.group(0)}*", emphasized, count=1)
@@ -2082,7 +2971,8 @@ class ConsultationService:
         return emphasized
 
     @classmethod
-    def _ensure_message_emojis(cls, text: str) -> str:
+    def _ensure_message_emojis(cls, text: str, language: str | None = None) -> str:
+        _ = language
         lines = text.splitlines()
         non_empty_indexes = [idx for idx, line in enumerate(lines) if line.strip()]
         if not non_empty_indexes:
@@ -2095,8 +2985,17 @@ class ConsultationService:
             emoji_count = 1
 
         if emoji_count < 2:
+            practical_markers = (
+                "практически",
+                "practical step",
+                "практикалык кадам",
+            )
             practical_idx = next(
-                (idx for idx in non_empty_indexes if lines[idx].strip().lower().startswith("практически")),
+                (
+                    idx
+                    for idx in non_empty_indexes
+                    if lines[idx].strip().lower().startswith(practical_markers)
+                ),
                 None,
             )
             if practical_idx is not None and cls._count_emojis(lines[practical_idx]) == 0:
@@ -2139,6 +3038,288 @@ class ConsultationService:
         return len(re.findall(r"\*[^*\n]+\*", text))
 
     @classmethod
+    def pick_emoji(cls, sentence: str) -> str | None:
+        lowered = sentence.lower()
+        for word, emoji in cls._SMART_EMOJI_MAP:
+            if word in lowered:
+                return emoji
+        return None
+
+    @classmethod
+    def add_smart_emojis(cls, text: str, max_emojis: int = 3) -> str:
+        normalized = (text or "").strip()
+        if not normalized:
+            return normalized
+
+        used = 0
+        emoji_toggle = False  # Каждое второе предложение.
+        paragraphs = [part.strip() for part in re.split(r"\n{2,}", normalized) if part.strip()]
+        if not paragraphs:
+            return normalized
+
+        rewritten_paragraphs: list[str] = []
+        for paragraph in paragraphs:
+            sentences = [item.strip() for item in re.split(r"(?<=[.!?])\s+", paragraph) if item.strip()]
+            if not sentences:
+                rewritten_paragraphs.append(paragraph)
+                continue
+
+            rewritten_sentences: list[str] = []
+            for sentence in sentences:
+                updated = sentence
+                if emoji_toggle and used < max_emojis and cls._count_emojis(updated) == 0:
+                    emoji = cls.pick_emoji(updated)
+                    if emoji:
+                        if updated.endswith((".", "!", "?")):
+                            updated = f"{updated[:-1].rstrip()} {emoji}{updated[-1]}"
+                        else:
+                            updated = f"{updated} {emoji}"
+                        used += 1
+
+                rewritten_sentences.append(updated)
+                emoji_toggle = not emoji_toggle
+
+            rewritten_paragraphs.append(" ".join(rewritten_sentences).strip())
+
+        return "\n\n".join(rewritten_paragraphs).strip()
+
+    def _semantic_auto_format(
+        self,
+        text: str,
+        *,
+        user_text: str,
+        intent: IntentResult | None,
+    ) -> str:
+        normalized = text.strip()
+        if not normalized:
+            return normalized
+        if "\n\n" in normalized and len(user_text.strip()) < 110:
+            return normalized
+
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", normalized) if part.strip()]
+        if len(sentences) <= 2:
+            return normalized
+
+        is_short_request = len(user_text.strip()) < 80 or (intent is not None and intent.intent_type == "follow_up")
+        if is_short_request:
+            compact = " ".join(sentences[:3]).strip()
+            return compact if compact else normalized
+
+        blocks: list[str] = []
+        blocks.append(sentences[0])
+
+        explain_markers = (
+            "потому",
+            "из-за",
+            "поэтому",
+            "because",
+            "due to",
+            "ошондуктан",
+            "себеби",
+        )
+        action_markers = (
+            "начните",
+            "добав",
+            "использ",
+            "нанос",
+            "лучше",
+            "start",
+            "add",
+            "use",
+            "apply",
+            "try",
+            "башта",
+            "кош",
+            "колдон",
+        )
+        practical_markers = (
+            "практически",
+            "practical",
+            "практикалык",
+            "сегодня",
+            "today",
+            "бүгүн",
+        )
+
+        explain: list[str] = []
+        actions: list[str] = []
+        practical: list[str] = []
+        for sentence in sentences[1:]:
+            lowered = sentence.lower()
+            if any(marker in lowered for marker in practical_markers):
+                practical.append(sentence)
+            elif any(marker in lowered for marker in action_markers):
+                actions.append(sentence)
+            elif any(marker in lowered for marker in explain_markers):
+                explain.append(sentence)
+            else:
+                explain.append(sentence)
+
+        if explain:
+            blocks.append(" ".join(explain[:2]))
+        if actions:
+            blocks.append(" ".join(actions[:2]))
+        if practical:
+            blocks.append(" ".join(practical[:1]))
+
+        formatted = "\n\n".join(block for block in blocks if block.strip())
+        return formatted.strip() if formatted.strip() else normalized
+
+    def _semantic_emphasis_engine(self, text: str, *, max_fragments: int = 6) -> str:
+        highlighted = self._count_bold_fragments(text)
+        if highlighted >= max_fragments:
+            return self._enforce_bold_fragment_budget(text, max_fragments=max_fragments)
+
+        emphasized = text
+        phrases = (
+            "SPF 30+",
+            "SPF",
+            "патч-тест",
+            "patch test",
+            "ниацинамид",
+            "салициловая кислота",
+            "benzoyl peroxide",
+            "бензоилпероксид",
+            "азелаиновая кислота",
+            "ретинол",
+            "ретиналь",
+            "церамиды",
+            "ceramides",
+            "гиалуроновая кислота",
+            "hyaluronic acid",
+            "мягкое очищение",
+            "gentle cleanser",
+            "увлажняющий крем",
+            "moisturizer",
+            "практический шаг",
+            "practical step",
+        )
+
+        for phrase in phrases:
+            if highlighted >= max_fragments:
+                break
+            span = self._find_phrase_span(emphasized, phrase)
+            if span is None:
+                continue
+            start, end = span
+            emphasized = f"{emphasized[:start]}*{emphasized[start:end]}*{emphasized[end:]}"
+            highlighted += 1
+
+        return self._enforce_bold_fragment_budget(emphasized, max_fragments=max_fragments)
+
+    @staticmethod
+    def _find_phrase_span(text: str, phrase: str) -> tuple[int, int] | None:
+        lowered = text.lower()
+        target = phrase.lower()
+        offset = 0
+        while True:
+            idx = lowered.find(target, offset)
+            if idx == -1:
+                return None
+            end = idx + len(target)
+            left_ok = idx == 0 or not lowered[idx - 1].isalnum()
+            right_ok = end == len(lowered) or not lowered[end].isalnum()
+            wrapped_left = idx > 0 and text[idx - 1] == "*"
+            wrapped_right = end < len(text) and text[end] == "*"
+            if left_ok and right_ok and not (wrapped_left and wrapped_right):
+                return idx, end
+            offset = idx + 1
+
+    def _emoji_decision_layer(
+        self,
+        text: str,
+        language: str | None,
+        *,
+        user_text: str,
+        intent: IntentResult | None,
+    ) -> str:
+        normalized = text.strip()
+        if not normalized:
+            return normalized
+
+        if self._count_emojis(normalized) > 0:
+            return self._enforce_emoji_budget(normalized, max_emojis=3)
+
+        lang = normalize_language(language)
+        lines = normalized.splitlines()
+        non_empty = [idx for idx, line in enumerate(lines) if line.strip()]
+        if not non_empty:
+            return normalized
+
+        emoji_count = 0
+        if intent is not None and intent.intent_type in {"complaint", "emotion"}:
+            lines[non_empty[0]] = f"🤍 {lines[non_empty[0]].lstrip()}"
+            emoji_count += 1
+
+        if len(user_text.strip()) > 120 and emoji_count == 0:
+            lines[non_empty[0]] = f"✨ {lines[non_empty[0]].lstrip()}"
+            emoji_count += 1
+
+        practical_starts = (
+            "практически",
+            "practical step",
+            "практикалык кадам",
+        )
+        practical_idx = next(
+            (
+                idx
+                for idx in non_empty
+                if lines[idx].strip().lower().startswith(practical_starts)
+            ),
+            None,
+        )
+        if practical_idx is not None and emoji_count < 2 and self._count_emojis(lines[practical_idx]) == 0:
+            practical_emoji = "🧴" if lang in {"ru", "en"} else "🌿"
+            lines[practical_idx] = f"{practical_emoji} {lines[practical_idx].lstrip()}"
+
+        return self._enforce_emoji_budget("\n".join(lines), max_emojis=3)
+
+    def final_text_sanitizer(self, text: str) -> str:
+        sanitized = text.strip()
+        if not sanitized:
+            return sanitized
+        sanitized = self._repair_broken_word_chunks(sanitized)
+        sanitized = re.sub(r"[ \t]+\n", "\n", sanitized)
+        sanitized = re.sub(r"\n{3,}", "\n\n", sanitized)
+        sanitized = re.sub(r"(?m)^[,;:.!?\-]+\s*$", "", sanitized)
+        sanitized = self._sanitize_markdown_balance(sanitized)
+        sanitized = self._fix_ragged_ending(sanitized)
+        return sanitized.strip()
+
+    @staticmethod
+    def _sanitize_markdown_balance(text: str) -> str:
+        stars = text.count("*")
+        if stars % 2 == 0:
+            return text
+        last = text.rfind("*")
+        if last == -1:
+            return text
+        return f"{text[:last]}{text[last + 1:]}"
+
+    def _premium_quality_filter(self, text: str, language: str | None) -> str:
+        normalized = text.strip()
+        if not normalized:
+            return normalized
+        if not self._needs_premium_rewrite(normalized):
+            return normalized
+        rewritten = self.humanizer_pipeline(normalized, language)
+        rewritten = self._merge_short_paragraphs(rewritten)
+        return rewritten.strip()
+
+    def _needs_premium_rewrite(self, text: str) -> bool:
+        lowered = text.lower()
+        if any(marker in lowered for marker in ("в рамках", "данный", "следует отметить")):
+            return True
+        if re.search(r"(?i)\bочень хороший вопрос\.\s*очень хороший вопрос", text):
+            return True
+        lines = [line for line in text.splitlines() if line.strip()]
+        if any(len(line) > 260 for line in lines):
+            return True
+        if self._count_bold_fragments(text) > 7:
+            return True
+        return False
+
+    @classmethod
     def _strip_soft_closing_tail(cls, text: str) -> str:
         lines = text.splitlines()
         while lines and not lines[-1].strip():
@@ -2147,7 +3328,7 @@ class ConsultationService:
             return ""
 
         last = lines[-1].strip()
-        if any(last.lower() == closing.lower() for closing in cls._SOFT_CLOSINGS):
+        if any(last.lower() == closing.lower() for closing in all_soft_closings()):
             lines.pop()
             while lines and not lines[-1].strip():
                 lines.pop()
@@ -2160,9 +3341,14 @@ class ConsultationService:
         return any(marker in lowered for marker in cls._EXPLICIT_PURCHASE_MARKERS)
 
     @classmethod
-    def _is_cta_line(cls, line: str) -> bool:
+    def _requests_specific_brands_or_products(cls, text: str) -> bool:
+        lowered = text.lower()
+        return any(marker in lowered for marker in cls._SPECIFIC_BRAND_REQUEST_MARKERS)
+
+    @staticmethod
+    def _is_cta_line(line: str, language: str | None) -> bool:
         lowered = line.lower()
-        return lowered.startswith(cls._CTA_START_MARKERS)
+        return lowered.startswith(cta_starters(language))
 
     @classmethod
     def _is_reaction_line(cls, line: str) -> bool:
@@ -2186,17 +3372,18 @@ class ConsultationService:
         return any(marker in lowered for marker in cls._DOUBT_MARKERS)
 
     @staticmethod
-    def _technical_pause_fallback() -> str:
-        return "Вижу небольшую техническую паузу.\nПопробуйте ещё раз через несколько секунд."
+    def _technical_pause_fallback(session: UserSession) -> str:
+        return tr("tech_pause", session.language)
 
     @staticmethod
-    def _fallback_for_mode(mode: ChatMode) -> str:
+    def _fallback_for_mode(mode: ChatMode, session: UserSession) -> str:
+        lang = session.language
         if mode == ChatMode.CONSULTATION:
-            return "Понимаю Ваш запрос. Давайте мягко разберём уход по шагам и добавим безопасный следующий шаг."
+            return fallback_by_mode(lang, "consultation")
         if mode == ChatMode.SKIN_TYPE:
-            return "Понимаю Ваш запрос. Дам ориентир по типу кожи и практическую рекомендацию по уходу."
+            return fallback_by_mode(lang, "skin_type")
         if mode == ChatMode.PROBLEM_SOLVING:
-            return "Понимаю, это может беспокоить. Давайте разберём ситуацию и выберем безопасный план действий."
+            return fallback_by_mode(lang, "problem")
         if mode == ChatMode.INGREDIENT_CHECK:
-            return "Очень хороший вопрос. Давайте разберём состав по безопасности и практическому применению."
-        return "Понимаю Ваш вопрос. Давайте разберём его и определим конкретный следующий шаг по уходу."
+            return fallback_by_mode(lang, "ingredient")
+        return fallback_by_mode(lang, "chat")

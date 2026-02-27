@@ -16,9 +16,9 @@ logger = logging.getLogger(__name__)
 class OpenAIClient:
     """Resilient wrapper for OpenAI Responses API with retries."""
 
-    _MIN_OUTPUT_LIMIT = 900
+    _MIN_OUTPUT_LIMIT = 350
     _MAX_CONTINUATION_PASSES = 6
-    _CONTINUATION_PROMPT = "Продолжите ответ с места обрыва. Не повторяйте уже написанный текст."
+    _CONTINUATION_PROMPT = "Continue from where the reply was cut off. Do not repeat prior text."
 
     def __init__(self, settings: Settings, retries: int = 2) -> None:
         self._settings = settings
@@ -36,11 +36,11 @@ class OpenAIClient:
         dialogue: list[dict[str, str]],
         max_output_tokens: int | None = None,
         verbosity: str | None = None,
+        allow_small_output: bool = False,
     ) -> str:
-        output_limit = max(
-            max_output_tokens or self._settings.openai_max_output_tokens,
-            self._MIN_OUTPUT_LIMIT,
-        )
+        output_limit = max_output_tokens or self._settings.openai_max_output_tokens
+        if not allow_small_output:
+            output_limit = max(output_limit, self._MIN_OUTPUT_LIMIT)
         last_error: Exception | None = None
 
         for attempt in range(1, self._retries + 2):
@@ -95,6 +95,7 @@ class OpenAIClient:
         image_caption: str,
         max_output_tokens: int | None = None,
         verbosity: str | None = None,
+        allow_small_output: bool = False,
     ) -> str:
         return await self.generate_reply_with_images(
             system_prompt=system_prompt,
@@ -103,6 +104,7 @@ class OpenAIClient:
             user_text=image_caption,
             max_output_tokens=max_output_tokens,
             verbosity=verbosity,
+            allow_small_output=allow_small_output,
         )
 
     async def generate_reply_with_images(
@@ -114,11 +116,11 @@ class OpenAIClient:
         user_text: str,
         max_output_tokens: int | None = None,
         verbosity: str | None = None,
+        allow_small_output: bool = False,
     ) -> str:
-        output_limit = max(
-            max_output_tokens or self._settings.openai_max_output_tokens,
-            self._MIN_OUTPUT_LIMIT,
-        )
+        output_limit = max_output_tokens or self._settings.openai_max_output_tokens
+        if not allow_small_output:
+            output_limit = max(output_limit, self._MIN_OUTPUT_LIMIT)
         image_blocks = [self._image_block(image_bytes, mime_type) for image_bytes, mime_type in images]
 
         last_error: Exception | None = None

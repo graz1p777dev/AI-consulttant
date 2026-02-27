@@ -134,10 +134,31 @@ python main.py
 3. HTTPS (обязательно для Meta webhooks)
 4. Логи в stdout + сбор через journald/ELK/Loki
 
+## Деплой на Vercel
+
+В проект добавлены:
+
+- `vercel.json` (роутинг в Python serverless entrypoint)
+- `api/index.py` (ASGI app для webhook-каналов)
+
+Что важно:
+
+- На Vercel используйте webhook-каналы (`RUN_WHATSAPP=true` и/или `RUN_INSTAGRAM=true`).
+- Telegram polling (`RUN_TELEGRAM=true`) для Vercel не подходит.
+- `OPENAI_API_KEY` и channel credentials задайте в Vercel Environment Variables.
+
+Webhook URL на Vercel:
+
+- WhatsApp verify/callback: `https://<vercel-domain>/whatsapp/webhook`
+- Instagram verify/callback: `https://<vercel-domain>/instagram/webhook`
+
+Проверка:
+
+- `GET https://<vercel-domain>/healthz` -> `{"status":"ok"}`
+
 ## Замечания по безопасности
 
 - Не храните реальные ключи в репозитории
 - Проверка подписи webhook включена
 - Входные payload валидируются
 - Ограничен размер изображения
-

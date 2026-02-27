@@ -8,7 +8,7 @@ from typing import Any, Literal
 from demi_consultant.state.fsm import ChatMode
 
 Role = Literal["user", "assistant"]
-OnboardingStep = Literal["name", "age", "done"]
+OnboardingStep = Literal["language", "name", "age", "done"]
 
 
 @dataclass(slots=True)
@@ -31,6 +31,7 @@ class UserSession:
     mode: ChatMode = ChatMode.CHAT
 
     name: str | None = None
+    language: str | None = None
     age: int | None = None
     age_range: str | None = None
     onboarding_completed: bool = False
@@ -62,6 +63,10 @@ class UserSession:
 
     last_message_text: str | None = None
     repeated_count: int = 0
+    last_intent: str | None = None
+    consultation_turns: int = 0
+    soft_offer_sent: bool = False
+    awaiting_manager_confirmation: bool = False
     muted_until: float = 0.0
     blocked_until: float = 0.0
     message_timestamps: deque[float] = field(default_factory=deque)
@@ -113,11 +118,12 @@ class UserSession:
         self.images_in_session += 1
 
     def reset_onboarding(self) -> None:
+        self.language = None
         self.name = None
         self.age = None
         self.age_range = None
         self.onboarding_completed = False
-        self.onboarding_step = "name"
+        self.onboarding_step = "language"
         self.onboarding_attempts = 0
         self.menu_shown_once = False
         self.menu_active = False
@@ -127,6 +133,10 @@ class UserSession:
 
         self.last_message_text = None
         self.repeated_count = 0
+        self.last_intent = None
+        self.consultation_turns = 0
+        self.soft_offer_sent = False
+        self.awaiting_manager_confirmation = False
         self.muted_until = 0.0
         self.blocked_until = 0.0
         self.message_timestamps.clear()
