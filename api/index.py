@@ -1,9 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncIterator
 
 from fastapi import FastAPI
 
@@ -25,7 +24,7 @@ class _RuntimeClients:
     instagram: InstagramClient | None = None
 
 
-def _build_http_app() -> tuple[FastAPI, _RuntimeClients]:
+def _build_runtime_app() -> tuple[FastAPI, _RuntimeClients]:
     settings = get_settings()
     configure_logging(settings.debug)
 
@@ -82,17 +81,38 @@ def _build_http_app() -> tuple[FastAPI, _RuntimeClients]:
     return api_app, clients
 
 
-@asynccontextmanager
-async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
-    try:
-        yield
-    finally:
-        if _clients.whatsapp is not None:
-            await _clients.whatsapp.close()
-        if _clients.instagram is not None:
-            await _clients.instagram.close()
+app = FastAPI(title="Demi Consultant Vercel")
+_clients = _RuntimeClients()
+_initialized = False
+_init_lock = asyncio.Lock()
 
 
-_api_app, _clients = _build_http_app()
-app = FastAPI(title="Demi Consultant Vercel", lifespan=_lifespan)
-app.mount("/", _api_app)
+@app.get("/healthz")
+async def healthz() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+async def _ensure_initialized() -> None:
+    global _initialized, _clients
+    if _initialized:
+        return
+
+    async with _init_lock:
+        if _initialized:
+            return
+        runtime_app, _clients = _build_runtime_app()
+        app.mount("/", runtime_app)
+        _initialized = True
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    await _ensure_initialized()
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    if _clients.whatsapp is not None:
+        await _clients.whatsapp.close()
+    if _clients.instagram is not None:
+        await _clients.instagram.close()

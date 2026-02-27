@@ -121,7 +121,7 @@ class TelegramCosmoBot(BaseChannelAdapter):
 
         source_message = update.message
         user_id = str(update.effective_user.id)
-        text = source_message.text.strip()
+        text = source_message.text.strip() # pyright: ignore[reportOptionalMemberAccess]
         session_before = self._consultation_service.get_session(user_id)
         pending_message: Message | None = None
         acquired = False
