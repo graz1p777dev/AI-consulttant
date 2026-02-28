@@ -22,6 +22,12 @@ _telegram_app = None
 _telegram_secret = None
 
 
+def _is_enabled(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 async def _ensure_initialized() -> None:
     global _initialized, _telegram_app, _telegram_secret
     if _initialized:
@@ -48,9 +54,11 @@ async def _ensure_initialized() -> None:
 
         _telegram_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip() or None
 
+        # Keep manual webhook control by default.
+        auto_set_webhook = _is_enabled(os.getenv("AUTO_SET_TELEGRAM_WEBHOOK"))
         vercel_url = os.getenv("VERCEL_PROJECT_PRODUCTION_URL") or os.getenv("VERCEL_URL")
-        if vercel_url:
-            webhook_url = f"https://{vercel_url}/telegram/webhook"
+        if auto_set_webhook and vercel_url:
+            webhook_url = f"https://{vercel_url}/webhook"
             await _telegram_app.bot.set_webhook(
                 url=webhook_url,
                 secret_token=_telegram_secret,
@@ -133,3 +141,20 @@ async def webhook_post(request: Request) -> dict[str, bool]:
 @app.post("/")
 async def root_post(request: Request) -> dict[str, bool]:
     return await _handle_telegram_webhook(request)
+
+
+@app.get("/{full_path:path}")
+async def webhook_get_catchall(full_path: str) -> dict[str, str]:
+    path = full_path.strip("/").lower()
+    if path.endswith("webhook"):
+        await _ensure_initialized()
+        return {"status": "ok"}
+    raise HTTPException(status_code=404, detail="Not Found")
+
+
+@app.post("/{full_path:path}")
+async def webhook_post_catchall(full_path: str, request: Request) -> dict[str, bool]:
+    path = full_path.strip("/").lower()
+    if path.endswith("webhook"):
+        return await _handle_telegram_webhook(request)
+    raise HTTPException(status_code=404, detail="Not Found")
