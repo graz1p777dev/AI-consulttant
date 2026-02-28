@@ -28,13 +28,28 @@ def _is_enabled(value: str | None) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+async def _ensure_telegram_app_running() -> None:
+    if _telegram_app is None:
+        raise RuntimeError("Telegram app is not initialized")
+
+    initialized = bool(getattr(_telegram_app, "initialized", False))
+    running = bool(getattr(_telegram_app, "running", False))
+    if running:
+        return
+    if not initialized:
+        await _telegram_app.initialize()
+    await _telegram_app.start()
+
+
 async def _ensure_initialized() -> None:
     global _initialized, _telegram_app, _telegram_secret
     if _initialized:
+        await _ensure_telegram_app_running()
         return
 
     async with _init_lock:
         if _initialized:
+            await _ensure_telegram_app_running()
             return
 
         settings = get_settings()
@@ -49,8 +64,7 @@ async def _ensure_initialized() -> None:
 
         telegram_bot._register_handlers()  # noqa: SLF001
         _telegram_app = telegram_bot._application  # noqa: SLF001
-        await _telegram_app.initialize()
-        await _telegram_app.start()
+        await _ensure_telegram_app_running()
 
         _telegram_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip() or None
 
@@ -76,10 +90,10 @@ async def _startup() -> None:
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    if _telegram_app is None:
-        return
-    await _telegram_app.stop()
-    await _telegram_app.shutdown()
+    # Serverless platforms may trigger shutdown between invocations.
+    # Keep state cleanup to process termination to avoid stopping handlers
+    # while the module instance is reused.
+    return
 
 
 @app.get("/healthz")
