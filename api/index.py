@@ -87,6 +87,12 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/healthz")
+async def healthz_webhook(request: Request) -> dict[str, bool]:
+    # Fallback webhook endpoint: useful when edge routing rewrites custom paths.
+    return await _handle_telegram_webhook(request)
+
+
 @app.get("/telegram/webhook")
 async def telegram_webhook_get() -> dict[str, str]:
     await _ensure_initialized()
@@ -143,10 +149,24 @@ async def root_post(request: Request) -> dict[str, bool]:
     return await _handle_telegram_webhook(request)
 
 
+def _matches_webhook_alias(path: str) -> bool:
+    normalized = path.strip("/").lower()
+    if not normalized:
+        return True
+    if normalized.endswith("webhook"):
+        return True
+    return normalized in {
+        "api",
+        "api/index",
+        "api/app",
+        "api/index.py",
+        "api/app.py",
+    }
+
+
 @app.get("/{full_path:path}")
 async def webhook_get_catchall(full_path: str) -> dict[str, str]:
-    path = full_path.strip("/").lower()
-    if path.endswith("webhook"):
+    if _matches_webhook_alias(full_path):
         await _ensure_initialized()
         return {"status": "ok"}
     raise HTTPException(status_code=404, detail="Not Found")
@@ -154,7 +174,6 @@ async def webhook_get_catchall(full_path: str) -> dict[str, str]:
 
 @app.post("/{full_path:path}")
 async def webhook_post_catchall(full_path: str, request: Request) -> dict[str, bool]:
-    path = full_path.strip("/").lower()
-    if path.endswith("webhook"):
+    if _matches_webhook_alias(full_path):
         return await _handle_telegram_webhook(request)
     raise HTTPException(status_code=404, detail="Not Found")
