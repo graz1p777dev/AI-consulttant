@@ -85,8 +85,19 @@ async def telegram_webhook_get() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/telegram/webhook")
-async def telegram_webhook(request: Request) -> dict[str, bool]:
+@app.get("/webhook")
+async def webhook_get() -> dict[str, str]:
+    await _ensure_initialized()
+    return {"status": "ok"}
+
+
+@app.get("/")
+async def root_get() -> dict[str, str]:
+    await _ensure_initialized()
+    return {"status": "ok"}
+
+
+async def _handle_telegram_webhook(request: Request) -> dict[str, bool]:
     await _ensure_initialized()
     if _telegram_app is None:
         raise HTTPException(status_code=503, detail="Telegram app is not initialized")
@@ -107,3 +118,18 @@ async def telegram_webhook(request: Request) -> dict[str, bool]:
 
     await _telegram_app.process_update(update)
     return {"ok": True}
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request) -> dict[str, bool]:
+    return await _handle_telegram_webhook(request)
+
+
+@app.post("/webhook")
+async def webhook_post(request: Request) -> dict[str, bool]:
+    return await _handle_telegram_webhook(request)
+
+
+@app.post("/")
+async def root_post(request: Request) -> dict[str, bool]:
+    return await _handle_telegram_webhook(request)
