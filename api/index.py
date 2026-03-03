@@ -85,7 +85,13 @@ async def _ensure_initialized() -> None:
 
 @app.on_event("startup")
 async def _startup() -> None:
-    await _ensure_initialized()
+    # On serverless platforms startup can be triggered by arbitrary probes
+    # (e.g. favicon or health checks). Do not fail cold start here;
+    # initialize lazily on webhook endpoints.
+    try:
+        await _ensure_initialized()
+    except Exception as exc:  # pragma: no cover - startup resilience
+        logger.exception("Deferred Telegram initialization after startup failure: %s", exc)
 
 
 @app.on_event("shutdown")
@@ -109,24 +115,24 @@ async def healthz_webhook(request: Request) -> dict[str, bool]:
 
 @app.get("/telegram/webhook")
 async def telegram_webhook_get() -> dict[str, str]:
-    await _ensure_initialized()
     return {"status": "ok"}
 
 
 @app.get("/webhook")
 async def webhook_get() -> dict[str, str]:
-    await _ensure_initialized()
     return {"status": "ok"}
 
 
 @app.get("/")
 async def root_get() -> dict[str, str]:
-    await _ensure_initialized()
     return {"status": "ok"}
 
 
 async def _handle_telegram_webhook(request: Request) -> dict[str, bool]:
-    await _ensure_initialized()
+    try:
+        await _ensure_initialized()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Telegram initialization failed: {exc}") from exc
     if _telegram_app is None:
         raise HTTPException(status_code=503, detail="Telegram app is not initialized")
 
@@ -181,7 +187,6 @@ def _matches_webhook_alias(path: str) -> bool:
 @app.get("/{full_path:path}")
 async def webhook_get_catchall(full_path: str) -> dict[str, str]:
     if _matches_webhook_alias(full_path):
-        await _ensure_initialized()
         return {"status": "ok"}
     raise HTTPException(status_code=404, detail="Not Found")
 
