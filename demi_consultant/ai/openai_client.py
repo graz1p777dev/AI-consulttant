@@ -34,10 +34,12 @@ class OpenAIClient:
         *,
         system_prompt: str,
         dialogue: list[dict[str, str]],
+        model_name: str | None = None,
         max_output_tokens: int | None = None,
         verbosity: str | None = None,
         allow_small_output: bool = False,
     ) -> str:
+        selected_model = (model_name or self._settings.model_name).strip() or self._settings.model_name
         output_limit = max_output_tokens or self._settings.openai_max_output_tokens
         if not allow_small_output:
             output_limit = max(output_limit, self._MIN_OUTPUT_LIMIT)
@@ -48,6 +50,7 @@ class OpenAIClient:
                 text, truncated = await self._request_text(
                     system_prompt=system_prompt,
                     dialogue=dialogue,
+                    model_name=selected_model,
                     output_limit=output_limit,
                     verbosity=verbosity,
                 )
@@ -64,6 +67,7 @@ class OpenAIClient:
                                 {"role": "assistant", "content": merged_text},
                                 {"role": "user", "content": self._CONTINUATION_PROMPT},
                             ],
+                            model_name=selected_model,
                             output_limit=output_limit,
                             verbosity=verbosity or "low",
                         )
@@ -93,6 +97,7 @@ class OpenAIClient:
         image_bytes: bytes,
         image_mime_type: str,
         image_caption: str,
+        model_name: str | None = None,
         max_output_tokens: int | None = None,
         verbosity: str | None = None,
         allow_small_output: bool = False,
@@ -102,6 +107,7 @@ class OpenAIClient:
             dialogue=dialogue,
             images=[(image_bytes, image_mime_type)],
             user_text=image_caption,
+            model_name=model_name,
             max_output_tokens=max_output_tokens,
             verbosity=verbosity,
             allow_small_output=allow_small_output,
@@ -114,10 +120,12 @@ class OpenAIClient:
         dialogue: list[dict[str, str]],
         images: list[tuple[bytes, str]],
         user_text: str,
+        model_name: str | None = None,
         max_output_tokens: int | None = None,
         verbosity: str | None = None,
         allow_small_output: bool = False,
     ) -> str:
+        selected_model = (model_name or self._settings.model_name).strip() or self._settings.model_name
         output_limit = max_output_tokens or self._settings.openai_max_output_tokens
         if not allow_small_output:
             output_limit = max(output_limit, self._MIN_OUTPUT_LIMIT)
@@ -131,6 +139,7 @@ class OpenAIClient:
                     dialogue=dialogue,
                     image_blocks=image_blocks,
                     caption=user_text,
+                    model_name=selected_model,
                     output_limit=output_limit,
                     verbosity=verbosity,
                 )
@@ -149,6 +158,7 @@ class OpenAIClient:
                             ],
                             image_blocks=image_blocks,
                             caption=user_text,
+                            model_name=selected_model,
                             output_limit=output_limit,
                             verbosity=verbosity or "low",
                         )
@@ -170,6 +180,53 @@ class OpenAIClient:
 
         raise AIClientError("OpenAI image retries exhausted") from last_error
 
+    async def transcribe_audio(
+        self,
+        *,
+        audio_bytes: bytes,
+        file_name: str,
+        mime_type: str | None = None,
+        language: str | None = None,
+    ) -> str:
+        if not audio_bytes:
+            raise AIClientError("audio payload is empty")
+
+        file_payload: tuple[str, bytes] | tuple[str, bytes, str]
+        if mime_type:
+            file_payload = (file_name, audio_bytes, mime_type)
+        else:
+            file_payload = (file_name, audio_bytes)
+
+        payload: dict[str, Any] = {
+            "model": self._settings.audio_transcribe_model,
+            "file": file_payload,
+        }
+
+        normalized_language = (language or "").strip().lower()
+        language_map = {"ru": "ru", "en": "en", "kg": "ky"}
+        transcription_language = language_map.get(normalized_language)
+        if transcription_language:
+            payload["language"] = transcription_language
+
+        last_error: Exception | None = None
+        for attempt in range(1, self._retries + 2):
+            try:
+                transcription = await self._client.audio.transcriptions.create(**payload)
+                text = self._extract_transcription_text(transcription)
+                if text:
+                    return text
+
+                last_error = AIClientError("audio transcription is empty")
+                logger.warning("OpenAI audio transcription attempt %s returned empty text", attempt)
+            except Exception as exc:
+                last_error = exc
+                logger.warning("OpenAI audio transcription attempt %s failed: %s", attempt, exc)
+
+            if attempt <= self._retries:
+                await asyncio.sleep(0.7 * attempt)
+
+        raise AIClientError("OpenAI audio transcription retries exhausted") from last_error
+
     def _image_block(self, image_bytes: bytes, image_mime_type: str) -> dict[str, str]:
         encoded_image = base64.b64encode(image_bytes).decode("ascii")
         image_url = f"data:{image_mime_type};base64,{encoded_image}"
@@ -180,14 +237,15 @@ class OpenAIClient:
         *,
         system_prompt: str,
         dialogue: list[dict[str, str]],
+        model_name: str,
         output_limit: int,
         verbosity: str | None,
     ) -> tuple[str, bool]:
         payload: dict[str, Any] = {
-            "model": self._settings.model_name,
+            "model": model_name,
             "max_output_tokens": output_limit,
             "input": [{"role": "system", "content": system_prompt}, *dialogue],
-            **self._reasoning_params(verbosity),
+            **self._reasoning_params(model_name, verbosity),
         }
         if self._temperature_supported is not False:
             payload["temperature"] = 0.5
@@ -202,11 +260,12 @@ class OpenAIClient:
         dialogue: list[dict[str, str]],
         image_blocks: list[dict[str, str]],
         caption: str,
+        model_name: str,
         output_limit: int,
         verbosity: str | None,
     ) -> tuple[str, bool]:
         payload: dict[str, Any] = {
-            "model": self._settings.model_name,
+            "model": model_name,
             "max_output_tokens": output_limit,
             "input": [
                 {"role": "system", "content": system_prompt},
@@ -219,7 +278,7 @@ class OpenAIClient:
                     ],
                 },
             ],
-            **self._reasoning_params(verbosity),
+            **self._reasoning_params(model_name, verbosity),
         }
         if self._temperature_supported is not False:
             payload["temperature"] = 0.5
@@ -241,8 +300,8 @@ class OpenAIClient:
                 return await self._client.responses.create(**payload)
             raise
 
-    def _reasoning_params(self, verbosity: str | None) -> dict[str, Any]:
-        model = self._settings.model_name.lower()
+    def _reasoning_params(self, model_name: str, verbosity: str | None) -> dict[str, Any]:
+        model = model_name.lower()
         if model.startswith("gpt-5"):
             selected = verbosity or "low"
             if selected not in {"low", "medium", "high"}:
@@ -315,3 +374,18 @@ class OpenAIClient:
             return base
         separator = "" if base.endswith(("\n", " ")) else " "
         return f"{base}{separator}{extra}".strip()
+
+    @staticmethod
+    def _extract_transcription_text(transcription: Any) -> str:
+        if isinstance(transcription, str):
+            return transcription.strip()
+
+        text: Any
+        if isinstance(transcription, dict):
+            text = transcription.get("text")
+        else:
+            text = getattr(transcription, "text", None)
+
+        if isinstance(text, str):
+            return text.strip()
+        return ""

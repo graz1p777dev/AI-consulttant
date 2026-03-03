@@ -14,6 +14,8 @@ from demi_consultant.core.exceptions import ConfigError
 class Settings:
     openai_api_key: str
     model_name: str
+    voice_reply_model: str
+    audio_transcribe_model: str
     debug: bool
     request_timeout_seconds: float
     openai_max_output_tokens: int
@@ -34,6 +36,7 @@ class Settings:
     human_contact: str
 
     telegram_token: str | None
+    telegram_proxy_url: str | None
 
     meta_api_version: str
     webhook_host: str
@@ -93,6 +96,11 @@ class Settings:
             raise ConfigError("OPENAI_API_KEY is required")
 
         model_name = os.getenv("MODEL_NAME", "gpt-5-mini").strip() or "gpt-5-mini"
+        voice_reply_model = os.getenv("VOICE_REPLY_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+        audio_transcribe_model = (
+            os.getenv("AUDIO_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe").strip()
+            or "gpt-4o-mini-transcribe"
+        )
         debug = _as_bool("DEBUG", default=False)
 
         request_timeout_seconds = _as_float("REQUEST_TIMEOUT_SECONDS", default=25.0)
@@ -114,6 +122,7 @@ class Settings:
         human_contact = os.getenv("HUMAN_CONTACT", "@manager").strip() or "@manager"
 
         telegram_token = _or_none(os.getenv("TELEGRAM_TOKEN"))
+        telegram_proxy_url = _or_none(os.getenv("TELEGRAM_PROXY_URL"))
 
         meta_api_version = os.getenv("META_API_VERSION", "v23.0").strip() or "v23.0"
         webhook_host = os.getenv("WEBHOOK_HOST", "0.0.0.0").strip() or "0.0.0.0"
@@ -143,6 +152,8 @@ class Settings:
         return cls(
             openai_api_key=openai_api_key,
             model_name=model_name,
+            voice_reply_model=voice_reply_model,
+            audio_transcribe_model=audio_transcribe_model,
             debug=debug,
             request_timeout_seconds=request_timeout_seconds,
             openai_max_output_tokens=openai_max_output_tokens,
@@ -160,6 +171,7 @@ class Settings:
             max_image_size_mb=max_image_size_mb,
             human_contact=human_contact,
             telegram_token=telegram_token,
+            telegram_proxy_url=telegram_proxy_url,
             meta_api_version=meta_api_version,
             webhook_host=webhook_host,
             webhook_port_whatsapp=webhook_port_whatsapp,

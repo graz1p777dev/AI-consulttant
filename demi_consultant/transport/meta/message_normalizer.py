@@ -12,6 +12,7 @@ class NormalizedMessage:
     text: str | None = None
     image_bytes: bytes | None = None
     caption: str | None = None
+    media_kind: str | None = None
     media_id: str | None = None
     media_url: str | None = None
     mime_type: str | None = None
@@ -65,8 +66,23 @@ def normalize_whatsapp_payload(payload: dict[str, Any]) -> list[NormalizedMessag
                         NormalizedMessage(
                             user_id=user_id,
                             caption=str(image_obj.get("caption", "")).strip() or None,
+                            media_kind="image",
                             media_id=str(image_obj.get("id", "")).strip() or None,
                             mime_type=str(image_obj.get("mime_type", "")).strip() or None,
+                        )
+                    )
+                    continue
+
+                if message_type == "audio":
+                    audio_obj = message.get("audio")
+                    if not isinstance(audio_obj, dict):
+                        continue
+                    result.append(
+                        NormalizedMessage(
+                            user_id=user_id,
+                            media_kind="audio",
+                            media_id=str(audio_obj.get("id", "")).strip() or None,
+                            mime_type=str(audio_obj.get("mime_type", "")).strip() or None,
                         )
                     )
                     continue
@@ -138,7 +154,8 @@ def _normalize_instagram_event(event: Any, out: list[NormalizedMessage]) -> None
     for attachment in attachments:
         if not isinstance(attachment, dict):
             continue
-        if str(attachment.get("type", "")).strip() != "image":
+        attachment_type = str(attachment.get("type", "")).strip().lower()
+        if attachment_type not in {"image", "audio"}:
             continue
         payload = attachment.get("payload")
         if not isinstance(payload, dict):
@@ -148,6 +165,7 @@ def _normalize_instagram_event(event: Any, out: list[NormalizedMessage]) -> None
             NormalizedMessage(
                 user_id=user_id,
                 caption=str(payload.get("title", "")).strip() or None,
+                media_kind=attachment_type,
                 media_id=str(payload.get("id", "")).strip() or None,
                 media_url=str(payload.get("url", "")).strip() or None,
             )

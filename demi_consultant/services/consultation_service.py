@@ -533,12 +533,28 @@ class ConsultationService:
     def get_mode(self, user_id: str) -> ChatMode:
         return self._memory.get_or_create_session(user_id).mode
 
+    async def transcribe_audio(
+        self,
+        *,
+        audio_bytes: bytes,
+        file_name: str,
+        mime_type: str | None = None,
+        language: str | None = None,
+    ) -> str:
+        return await self._openai_client.transcribe_audio(
+            audio_bytes=audio_bytes,
+            file_name=file_name,
+            mime_type=mime_type,
+            language=language,
+        )
+
     async def process_message(
         self,
         *,
         user_id: str,
         text: str,
         channel: str,
+        model_name_override: str | None = None,
         event_ts: float | None = None,
     ) -> str | None:
         started_at = perf_counter()
@@ -734,6 +750,7 @@ class ConsultationService:
             raw_reply = await self._openai_client.generate_reply(
                 system_prompt=system_prompt,
                 dialogue=payload,
+                model_name=model_name_override,
                 max_output_tokens=max_tokens,
                 verbosity=verbosity,
             )

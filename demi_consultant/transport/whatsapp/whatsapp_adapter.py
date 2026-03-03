@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import mimetypes
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -11,6 +12,7 @@ from demi_consultant.core.exceptions import MetaAPIError, PayloadValidationError
 from demi_consultant.core.logger import log_extra
 from demi_consultant.integrations.meta_api.meta_client import MetaClient
 from demi_consultant.services.consultation_service import ConsultationService
+from demi_consultant.services.localization import text as tr
 from demi_consultant.transport.base_channel_adapter import BaseChannelAdapter
 from demi_consultant.transport.meta.message_normalizer import normalize_whatsapp_payload
 
@@ -31,11 +33,19 @@ class WhatsAppAdapter(BaseChannelAdapter):
         self.app = FastAPI(title="Demi Consultant WhatsApp Webhook")
         self._register_routes()
 
-    async def handle_text(self, user_id: str, text: str, *, event_ts: float | None = None) -> str | None:
+    async def handle_text(
+        self,
+        user_id: str,
+        text: str,
+        *,
+        event_ts: float | None = None,
+        model_name_override: str | None = None,
+    ) -> str | None:
         return await self._consultation_service.process_message(
             user_id=user_id,
             text=text,
             channel="whatsapp",
+            model_name_override=model_name_override,
             event_ts=event_ts,
         )
 
@@ -56,6 +66,61 @@ class WhatsAppAdapter(BaseChannelAdapter):
             image_mime_type=image_mime_type,
             event_ts=event_ts,
         )
+
+    async def handle_audio(
+        self,
+        user_id: str,
+        audio_bytes: bytes,
+        *,
+        audio_mime_type: str | None,
+        source_name: str,
+        event_ts: float | None = None,
+    ) -> str:
+        session = self._consultation_service.get_session(user_id)
+
+        try:
+            transcript = await self._consultation_service.transcribe_audio(
+                audio_bytes=audio_bytes,
+                file_name=source_name,
+                mime_type=audio_mime_type,
+                language=session.language,
+            )
+        except Exception as exc:  # pragma: no cover - transport safety net
+            logger.exception(
+                "WhatsApp audio transcription failed: %s",
+                exc,
+                extra=log_extra(channel="whatsapp", user_id=user_id),
+            )
+            return tr("technical_error", session.language)
+
+        transcript_text = transcript.strip()
+        if not transcript_text:
+            return tr("meaningless", session.language)
+
+        try:
+            return (
+                await self.handle_text(
+                    user_id,
+                    transcript_text,
+                    event_ts=event_ts,
+                    model_name_override=self._settings.voice_reply_model,
+                )
+                or tr("technical_error", session.language)
+            )
+        except Exception as exc:  # pragma: no cover - transport safety net
+            logger.exception(
+                "WhatsApp transcribed audio handling failed: %s",
+                exc,
+                extra=log_extra(channel="whatsapp", user_id=user_id),
+            )
+            return tr("technical_error", session.language)
+
+    @staticmethod
+    def _audio_filename(*, media_id: str | None, mime_type: str | None) -> str:
+        normalized_mime = (mime_type or "").split(";", 1)[0].strip().lower()
+        extension = mimetypes.guess_extension(normalized_mime) or ".ogg"
+        media_suffix = (media_id or "message").replace("/", "_")
+        return f"whatsapp_audio_{media_suffix}{extension}"
 
     def _register_routes(self) -> None:
         @self.app.get("/webhook")
@@ -95,13 +160,31 @@ class WhatsAppAdapter(BaseChannelAdapter):
                     if message.text is not None and message.text.strip():
                         reply = await self.handle_text(message.user_id, message.text)
                     elif message.media_id:
-                        image_bytes, mime_type = await self._meta_client.download_media(message.media_id)
-                        reply = await self.handle_image(
-                            message.user_id,
-                            image_bytes,
-                            caption=message.caption,
-                            image_mime_type=message.mime_type or mime_type,
+                        media_bytes, downloaded_mime_type = await self._meta_client.download_media(
+                            message.media_id
                         )
+                        resolved_mime = message.mime_type or downloaded_mime_type
+                        is_audio = (message.media_kind == "audio") or resolved_mime.lower().startswith(
+                            "audio/"
+                        )
+
+                        if is_audio:
+                            reply = await self.handle_audio(
+                                message.user_id,
+                                media_bytes,
+                                audio_mime_type=resolved_mime,
+                                source_name=self._audio_filename(
+                                    media_id=message.media_id,
+                                    mime_type=resolved_mime,
+                                ),
+                            )
+                        else:
+                            reply = await self.handle_image(
+                                message.user_id,
+                                media_bytes,
+                                caption=message.caption,
+                                image_mime_type=resolved_mime,
+                            )
                     else:
                         reply = None
 

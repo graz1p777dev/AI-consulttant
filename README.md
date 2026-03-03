@@ -11,6 +11,7 @@ Production-grade мультиканальная AI платформа косме
   - Instagram (Meta Graph webhook)
 - AI возможности:
   - консультации, определение типа кожи, разбор проблемы
+  - распознавание voice/audio (Telegram, WhatsApp, Instagram) -> текст -> ответ AI
   - vision-анализ фото
   - ingredient check (`ChatMode.INGREDIENT_CHECK`)
   - анализ прогресса кожи по фото
@@ -92,6 +93,8 @@ python main.py
 ## Переменные окружения (ключевые)
 
 - Core: `OPENAI_API_KEY`, `MODEL_NAME`, `REQUEST_TIMEOUT_SECONDS`
+- Audio: `VOICE_REPLY_MODEL` (default `gpt-4o-mini`), `AUDIO_TRANSCRIBE_MODEL` (default `gpt-4o-mini-transcribe`)
+- Telegram: `TELEGRAM_PROXY_URL` (optional, if direct access to `api.telegram.org` is blocked)
 - Meta: `META_API_VERSION`, `WEBHOOK_HOST`, `WHATSAPP_WEBHOOK_PORT`, `INSTAGRAM_WEBHOOK_PORT`
 - CRM: `CRM_ENABLED`, `CRM_STORAGE`, `CRM_JSON_PATH`
 - Безопасность: `WHATSAPP_APP_SECRET`, `INSTAGRAM_APP_SECRET`
@@ -127,7 +130,36 @@ python main.py
 
 ## Деплой на VPS
 
-Минимальный вариант:
+### Вариант 1: Docker (рекомендуется)
+
+1. Подготовьте `.env`:
+
+```bash
+cp .env.example .env
+```
+
+2. Заполните переменные в `.env` (минимум `OPENAI_API_KEY` и токены выбранных каналов).
+
+3. Запуск в Docker Compose:
+
+```bash
+docker compose up -d --build
+```
+
+4. Проверка:
+
+```bash
+docker compose ps
+docker compose logs -f demi-consultant
+```
+
+Что важно:
+
+- Контейнер публикует webhook-порты `8081` (WhatsApp) и `8082` (Instagram).
+- Данные CRM (json) сохраняются в `./data` на хосте.
+- Для внешнего доступа поставьте reverse proxy (Nginx/Caddy) и HTTPS.
+
+### Вариант 2: Без Docker
 
 1. Запуск через `systemd` или process manager (pm2/supervisor)
 2. Reverse proxy (Nginx/Caddy) на webhook-порты

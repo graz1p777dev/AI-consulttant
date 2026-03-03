@@ -1,0 +1,17 @@
+services:
+  demi-consultant:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: demi-consultant
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      WEBHOOK_HOST: 0.0.0.0
+      CRM_JSON_PATH: /app/data/crm_events.json
+    ports:
+      - "8081:8081"
+      - "8082:8082"
+    volumes:
+      - ./data:/app/data

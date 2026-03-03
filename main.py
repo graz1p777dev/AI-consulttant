@@ -24,33 +24,46 @@ async def _run_uvicorn(app: object, *, host: str, port: int, name: str) -> None:
     config = uvicorn.Config(app=app, host=host, port=port, log_level="info", access_log=False) # type: ignore
     server = uvicorn.Server(config=config)
     logger.info("Starting %s webhook server on %s:%s", name, host, port)
+    print(f"[INFO] uvicorn server configured for {name} at {host}:{port}")
     await server.serve()
 
 
 async def run() -> None:
+    print("[START] run() - loading settings")
     settings = get_settings()
+    print(f"[INFO] settings loaded: debug={settings.debug}, run_telegram={settings.run_telegram}, run_whatsapp={settings.run_whatsapp}, run_instagram={settings.run_instagram}")
     configure_logging(settings.debug)
+    print("[INFO] logging configured")
 
     limiter = RateLimiter(interval_seconds=settings.rate_limit_seconds)
+    print(f"[INFO] rate limiter created: interval_seconds={settings.rate_limit_seconds}")
     consultation_service = build_consultation_service(settings, rate_limiter=limiter)
+    print("[INFO] consultation service built")
 
     tasks: list[asyncio.Task[None]] = []
     closers: list[tuple[str, Callable[[], Awaitable[None]]]] = []
 
     if settings.run_telegram:
+        print("[INFO] RUN_TELEGRAM is enabled")
         if not settings.telegram_configured:
-            logger.warning("RUN_TELEGRAM enabled, but TELEGRAM_TOKEN is missing")
+            msg = "RUN_TELEGRAM enabled, but TELEGRAM_TOKEN is missing"
+            logger.warning(msg)
+            print(f"[WARNING] {msg}")
         else:
             telegram_bot = TelegramCosmoBot(settings=settings, consultation_service=consultation_service)
             logger.info("Starting Telegram polling")
+            print("[INFO] starting telegram polling task")
             tasks.append(asyncio.create_task(telegram_bot.run_polling()))
 
     if settings.run_whatsapp:
+        print("[INFO] RUN_WHATSAPP is enabled")
         if not settings.whatsapp_configured:
-            logger.warning(
+            msg = (
                 "RUN_WHATSAPP enabled, but WhatsApp credentials are incomplete "
                 "(WHATSAPP_PHONE_NUMBER_ID/WHATSAPP_ACCESS_TOKEN/WHATSAPP_VERIFY_TOKEN)"
             )
+            logger.warning(msg)
+            print(f"[WARNING] {msg}")
         else:
             whatsapp_client = MetaClient(
                 api_version=settings.meta_api_version,
@@ -59,11 +72,13 @@ async def run() -> None:
                 app_secret=settings.whatsapp_app_secret,
                 timeout=settings.request_timeout_seconds,
             )
+            print("[INFO] whatsapp client created")
             whatsapp_adapter = WhatsAppAdapter(
                 settings=settings,
                 consultation_service=consultation_service,
                 meta_client=whatsapp_client,
             )
+            print("[INFO] whatsapp adapter configured")
             tasks.append(
                 asyncio.create_task(
                     _run_uvicorn(
@@ -74,14 +89,18 @@ async def run() -> None:
                     )
                 )
             )
+            print("[INFO] whatsapp uvicorn task added")
             closers.append(("whatsapp", whatsapp_client.close))
 
     if settings.run_instagram:
+        print("[INFO] RUN_INSTAGRAM is enabled")
         if not settings.instagram_configured:
-            logger.warning(
+            msg = (
                 "RUN_INSTAGRAM enabled, but Instagram credentials are incomplete "
                 "(INSTAGRAM_ACCOUNT_ID/INSTAGRAM_ACCESS_TOKEN/INSTAGRAM_VERIFY_TOKEN)"
             )
+            logger.warning(msg)
+            print(f"[WARNING] {msg}")
         else:
             instagram_client = InstagramClient(
                 api_version=settings.meta_api_version,
@@ -90,11 +109,13 @@ async def run() -> None:
                 app_secret=settings.instagram_app_secret,
                 timeout=settings.request_timeout_seconds,
             )
+            print("[INFO] instagram client created")
             instagram_adapter = InstagramAdapter(
                 settings=settings,
                 consultation_service=consultation_service,
                 instagram_client=instagram_client,
             )
+            print("[INFO] instagram adapter configured")
             tasks.append(
                 asyncio.create_task(
                     _run_uvicorn(
@@ -105,9 +126,11 @@ async def run() -> None:
                     )
                 )
             )
+            print("[INFO] instagram uvicorn task added")
             closers.append(("instagram", instagram_client.close))
 
     if not tasks:
+        print("[ERROR] no tasks were started, raising ConfigError")
         raise ConfigError(
             "No channels started. Enable RUN_TELEGRAM/RUN_WHATSAPP/RUN_INSTAGRAM "
             "and provide channel credentials."
@@ -128,6 +151,12 @@ def main() -> None:
         asyncio.run(run())
     except KeyboardInterrupt:
         logger.info("Shutdown requested by user")
+        print("[INFO] shutdown requested via KeyboardInterrupt")
+    except Exception as exc:
+        # ensure any uncaught error is visible in stdout
+        logger.exception("Unhandled exception in main")
+        print("[ERROR] unhandled exception in main:", exc)
+        raise
 
 
 if __name__ == "__main__":
