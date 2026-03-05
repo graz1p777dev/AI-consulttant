@@ -9,6 +9,7 @@ Production-grade мультиканальная AI платформа косме
   - Telegram (polling)
   - WhatsApp (Meta Cloud API webhook)
   - Instagram (Meta Graph webhook)
+  - HTTP API (FastAPI) для терминала/сайта
 - AI возможности:
   - консультации, определение типа кожи, разбор проблемы
   - распознавание voice/audio (Telegram, WhatsApp, Instagram) -> текст -> ответ AI
@@ -81,6 +82,7 @@ cp .env.example .env
 - `RUN_TELEGRAM=true|false`
 - `RUN_WHATSAPP=true|false`
 - `RUN_INSTAGRAM=true|false`
+- `RUN_API=true|false`
 
 5. Запуск:
 
@@ -95,12 +97,37 @@ python main.py
 - Core: `OPENAI_API_KEY`, `MODEL_NAME`, `REQUEST_TIMEOUT_SECONDS`
 - Audio: `VOICE_REPLY_MODEL` (default `gpt-4o-mini`), `AUDIO_TRANSCRIBE_MODEL` (default `gpt-4o-mini-transcribe`)
 - Telegram: `TELEGRAM_PROXY_URL` (optional, if direct access to `api.telegram.org` is blocked)
+- API: `RUN_API`, `API_HOST`, `API_PORT`, `API_BEARER_TOKEN` (optional bearer auth)
 - Meta: `META_API_VERSION`, `WEBHOOK_HOST`, `WHATSAPP_WEBHOOK_PORT`, `INSTAGRAM_WEBHOOK_PORT`
 - CRM: `CRM_ENABLED`, `CRM_STORAGE`, `CRM_JSON_PATH`
 - Безопасность: `WHATSAPP_APP_SECRET`, `INSTAGRAM_APP_SECRET`
 - Anti-spam: `MAX_USER_TEXT_LENGTH`, `RATE_LIMIT_SECONDS`, `MAX_CONTEXT_TOKENS`, `MAX_IMAGE_SIZE_MB`
 
 Полный список: `.env.example`
+
+## HTTP API (терминал/сайт)
+
+Если `RUN_API=true`, `main.py` поднимет API на `API_HOST:API_PORT` (по умолчанию `0.0.0.0:8090`).
+
+Проверка:
+
+```bash
+curl http://127.0.0.1:8090/healthz
+```
+
+Текстовый запрос:
+
+```bash
+curl -X POST http://127.0.0.1:8090/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"web-user-1","text":"У меня сухая кожа после умывания"}'
+```
+
+Если включен `API_BEARER_TOKEN`, добавляйте заголовок:
+
+```bash
+-H "Authorization: Bearer <token>"
+```
 
 ## Onboarding flow
 

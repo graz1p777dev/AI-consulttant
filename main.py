@@ -14,6 +14,7 @@ from demi_consultant.integrations.meta_api.instagram_client import InstagramClie
 from demi_consultant.integrations.meta_api.meta_client import MetaClient
 from demi_consultant.transport.instagram.instagram_adapter import InstagramAdapter
 from demi_consultant.transport.rate_limit import RateLimiter
+from demi_consultant.transport.http.http_api import HTTPAPIAdapter
 from demi_consultant.transport.telegram.telegram_bot import TelegramCosmoBot
 from demi_consultant.transport.whatsapp.whatsapp_adapter import WhatsAppAdapter
 
@@ -31,7 +32,14 @@ async def _run_uvicorn(app: object, *, host: str, port: int, name: str) -> None:
 async def run() -> None:
     print("[START] run() - loading settings")
     settings = get_settings()
-    print(f"[INFO] settings loaded: debug={settings.debug}, run_telegram={settings.run_telegram}, run_whatsapp={settings.run_whatsapp}, run_instagram={settings.run_instagram}")
+    print(
+        "[INFO] settings loaded: "
+        f"debug={settings.debug}, "
+        f"run_telegram={settings.run_telegram}, "
+        f"run_whatsapp={settings.run_whatsapp}, "
+        f"run_instagram={settings.run_instagram}, "
+        f"run_api={settings.run_api}"
+    )
     configure_logging(settings.debug)
     print("[INFO] logging configured")
 
@@ -129,11 +137,26 @@ async def run() -> None:
             print("[INFO] instagram uvicorn task added")
             closers.append(("instagram", instagram_client.close))
 
+    if settings.run_api:
+        print("[INFO] RUN_API is enabled")
+        api_adapter = HTTPAPIAdapter(settings=settings, consultation_service=consultation_service)
+        tasks.append(
+            asyncio.create_task(
+                _run_uvicorn(
+                    api_adapter.app,
+                    host=settings.api_host,
+                    port=settings.api_port,
+                    name="HTTP API",
+                )
+            )
+        )
+        print(f"[INFO] HTTP API task added on {settings.api_host}:{settings.api_port}")
+
     if not tasks:
         print("[ERROR] no tasks were started, raising ConfigError")
         raise ConfigError(
-            "No channels started. Enable RUN_TELEGRAM/RUN_WHATSAPP/RUN_INSTAGRAM "
-            "and provide channel credentials."
+            "No channels started. Enable RUN_TELEGRAM/RUN_WHATSAPP/RUN_INSTAGRAM/RUN_API "
+            "and provide required credentials."
         )
 
     try:

@@ -15,6 +15,7 @@ LANGUAGE_BUTTONS: dict[LanguageCode, str] = {
 
 _LANGUAGE_SELECTION_TEXT = (
     "Здравствуйте 👋\n"
+    "Пожалуйста, выберите язык 👇\n"
     "Please choose your language 👇\n"
     "Тилди тандаңыз 👇"
 )

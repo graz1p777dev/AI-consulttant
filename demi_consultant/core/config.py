@@ -56,6 +56,11 @@ class Settings:
     run_telegram: bool
     run_whatsapp: bool
     run_instagram: bool
+    run_api: bool
+
+    api_host: str
+    api_port: int
+    api_bearer_token: str | None
 
     crm_enabled: bool
     crm_storage: str
@@ -142,6 +147,11 @@ class Settings:
         run_telegram = _as_bool("RUN_TELEGRAM", default=True)
         run_whatsapp = _as_bool("RUN_WHATSAPP", default=False)
         run_instagram = _as_bool("RUN_INSTAGRAM", default=False)
+        run_api = _as_bool("RUN_API", default=False)
+
+        api_host = os.getenv("API_HOST", "0.0.0.0").strip() or "0.0.0.0"
+        api_port = _as_int("API_PORT", default=8090)
+        api_bearer_token = _or_none(os.getenv("API_BEARER_TOKEN"))
 
         crm_enabled = _as_bool("CRM_ENABLED", default=True)
         crm_storage = os.getenv("CRM_STORAGE", "memory").strip().lower() or "memory"
@@ -187,6 +197,10 @@ class Settings:
             run_telegram=run_telegram,
             run_whatsapp=run_whatsapp,
             run_instagram=run_instagram,
+            run_api=run_api,
+            api_host=api_host,
+            api_port=api_port,
+            api_bearer_token=api_bearer_token,
             crm_enabled=crm_enabled,
             crm_storage=crm_storage,
             crm_json_path=crm_json_path,

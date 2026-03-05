@@ -34,6 +34,7 @@ class InteractionGuardService:
     _language_chars_pattern = re.compile(r"^[a-zA-Zа-яА-ЯёЁңүөҢҮӨ\s.,!?;:'\"()\-]+$")
     _letter_pattern = re.compile(r"[a-zA-Zа-яА-ЯёЁңүөҢҮӨ]")
     _token_pattern = re.compile(r"[a-zA-Zа-яА-ЯёЁңүөҢҮӨ0-9]+")
+    _url_pattern = re.compile(r"(https?://|www\.)", re.IGNORECASE)
     _keyboard_mash_markers = (
         "qwerty",
         "asdf",
@@ -59,6 +60,9 @@ class InteractionGuardService:
         "чоң рахмат",
         "ясно",
     }
+    _BURST_WINDOW_SECONDS = 8
+    _BURST_MAX_MESSAGES = 4
+    _SOFT_BURST_MUTE_SECONDS = 18
 
     def __init__(self, settings: Settings, rate_limiter: RateLimiter) -> None:
         self._settings = settings
@@ -75,7 +79,12 @@ class InteractionGuardService:
     ) -> InputGuardDecision:
         now = event_ts if event_ts is not None else time()
 
-        block_decision = self._check_common_limits(session, user_id, now)
+        block_decision = self._check_common_limits(
+            session,
+            user_id,
+            now,
+            onboarding_incomplete=onboarding_incomplete,
+        )
         if block_decision is not None:
             return block_decision
 
@@ -106,16 +115,21 @@ class InteractionGuardService:
 
         anti_spam_active = session.total_messages_received > 5
 
-        if anti_spam_active:
-            repeat_count = session.track_repeat(normalized)
-            if repeat_count == 3:
-                return InputGuardDecision(allowed=False, ignore=True)
-            if repeat_count >= 5:
-                session.muted_until = now + self._settings.repeat_mute_seconds
-                return InputGuardDecision(
-                    allowed=False,
-                    ignore=True,
-                )
+        repeat_count = session.track_repeat(normalized)
+        if repeat_count == 3:
+            return InputGuardDecision(allowed=False, ignore=True)
+        if repeat_count >= 5:
+            session.muted_until = now + self._settings.repeat_mute_seconds
+            return InputGuardDecision(
+                allowed=False,
+                ignore=True,
+            )
+
+        if self._is_link_flood(text):
+            return InputGuardDecision(
+                allowed=False,
+                response=tr("meaningless", session.language),
+            )
 
         if self._is_meaningless(normalized):
             return InputGuardDecision(
@@ -211,12 +225,18 @@ class InteractionGuardService:
         session: UserSession,
         user_id: str,
         now: float,
+        *,
+        onboarding_incomplete: bool = False,
     ) -> InputGuardDecision | None:
         if now < session.blocked_until:
             return InputGuardDecision(allowed=False, ignore=True)
 
         message_rate = session.register_message(now, window_seconds=self._settings.abuse_window_seconds)
         anti_spam_active = session.total_messages_received > 5
+
+        if (not onboarding_incomplete) and session.total_messages_received >= 3 and self._is_fast_burst(session, now):
+            session.muted_until = max(session.muted_until, now + self._SOFT_BURST_MUTE_SECONDS)
+            return InputGuardDecision(allowed=False, ignore=True)
 
         if anti_spam_active and message_rate > self._settings.abuse_max_messages:
             session.blocked_until = now + self._settings.abuse_block_seconds
@@ -327,7 +347,7 @@ class InteractionGuardService:
             token = tokens[0]
             if len(token) >= 10 and self._token_vowel_ratio(token) < 0.22:
                 return True
-            if len(token) >= 12 and token.isalpha():
+            if len(token) >= 18 and token.isalpha():
                 return True
         short_noise = sum(1 for token in tokens if len(token) <= 2)
         if short_noise >= max(3, len(tokens) // 2 + 1):
@@ -349,7 +369,7 @@ class InteractionGuardService:
         for token in tokens:
             if len(token) >= 9 and self._token_vowel_ratio(token) < 0.2:
                 bad += 1
-            elif len(token) >= 12 and token.isalpha():
+            elif len(token) >= 18 and token.isalpha():
                 bad += 1
         return bad >= 2 or (len(tokens) == 1 and bad == 1)
 
@@ -364,3 +384,19 @@ class InteractionGuardService:
     @staticmethod
     def _normalize(text: str) -> str:
         return " ".join(text.lower().split()).strip()
+
+    @classmethod
+    def _is_link_flood(cls, text: str) -> bool:
+        return len(cls._url_pattern.findall(text)) >= 3
+
+    @classmethod
+    def _is_fast_burst(cls, session: UserSession, now: float) -> bool:
+        cutoff = now - cls._BURST_WINDOW_SECONDS
+        recent_count = 0
+        for ts in reversed(session.message_timestamps):
+            if ts < cutoff:
+                break
+            recent_count += 1
+            if recent_count >= cls._BURST_MAX_MESSAGES:
+                return True
+        return False
